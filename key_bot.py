@@ -797,8 +797,10 @@ async def review_panel(interaction: discord.Interaction,
         title=title or "⭐ รีวิวจากลูกค้า",
         description=description or "กดปุ่มด้านล่างเพื่อเขียนรีวิว ข้อความจะถูกส่งไปยังห้องรีวิว",
         color=0x5865F2)
+    view = discord.ui.View(timeout=None)
+    view.add_item(ReviewPanelButton(review_channel.id))
     try:
-        await panel_channel.send(embed=e, view=ReviewPanelButton(review_channel.id))
+        await panel_channel.send(embed=e, view=view)
     except discord.Forbidden:
         return await interaction.response.send_message(
             f"❌ บอทส่งข้อความใน {panel_channel.mention} ไม่ได้", ephemeral=True)
