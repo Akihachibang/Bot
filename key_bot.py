@@ -692,10 +692,13 @@ class ReviewModal(discord.ui.Modal):
         self.add_item(self.review_text)
 
     async def on_submit(self, interaction: discord.Interaction):
+        # ตอบรับ interaction ทันที ป้องกัน Discord timeout ระหว่างส่งรีวิว/แก้ Topic
+        await interaction.response.defer(ephemeral=True, thinking=True)
         channel = interaction.guild.get_channel(self.destination_id) if interaction.guild else None
         if not isinstance(channel, discord.TextChannel):
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ ไม่พบห้องสำหรับส่งรีวิว กรุณาแจ้งแอดมิน", ephemeral=True)
+
         e = discord.Embed(
             title="⭐ รีวิวใหม่",
             description=self.review_text.value.strip(),
@@ -706,19 +709,22 @@ class ReviewModal(discord.ui.Modal):
                      icon_url=interaction.user.display_avatar.url)
         try:
             await channel.send(embed=e)
-        except discord.HTTPException as ex:
+        except Exception as ex:
             print("review send error:", repr(ex))
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ ส่งรีวิวไม่สำเร็จ กรุณาลองใหม่หรือติดต่อแอดมิน", ephemeral=True)
+
         try:
             count = await increment_review_topic_counter(channel)
-        except discord.HTTPException as ex:
-            print("review topic counter update error:", repr(ex))
-            return await interaction.response.send_message(
-                "✅ ส่งรีวิวแล้ว แต่ปรับ Topic ไม่สำเร็จ กรุณาให้บอทมีสิทธิ์ Manage Channels ในห้องรีวิว",
-                ephemeral=True)
-        await interaction.response.send_message(
+        except Exception as ex:
+            print(f"review topic counter update error (channel={channel.id}):", repr(ex))
+            return await interaction.followup.send(
+                "✅ รีวิวถูกส่งแล้ว แต่แก้ Channel Topic ไม่สำเร็จ "
+                "กรุณาตรวจสิทธิ์ Manage Channels ของบอทในห้องรีวิว", ephemeral=True)
+        print(f"[review] updated topic counter: channel={channel.id}, count={count}")
+        await interaction.followup.send(
             f"✅ ส่งรีวิวเรียบร้อย ขอบคุณมากครับ/ค่ะ (เครดิตรีวิว: {count})", ephemeral=True)
+
 
 
 class ReviewPanelButton(discord.ui.DynamicItem[discord.ui.Button],
