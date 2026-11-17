@@ -41,6 +41,11 @@ POLL_SECONDS = 10
 # ถ้ามีไฟล์ qr.png วางข้าง key_bot.py บอทจะใช้ไฟล์นี้ก่อน (ไม่มีวันหมดอายุ แนะนำวิธีนี้)
 # ถ้าไม่มี จะใช้ลิงก์ด้านล่าง (ลิงก์ Discord CDN มีวันหมดอายุ)
 QR_LOCAL_FILE = "qr.png"
+# จำกัดขนาด/จำนวนรูปสลิปที่บอทส่งต่อให้ทีมงาน เพื่อลดการใช้หน่วยความจำบน Railway
+MAX_SLIP_BYTES = 8 * 1024 * 1024
+MAX_SLIP_TOTAL_BYTES = 16 * 1024 * 1024
+MAX_SLIP_FILES = 4
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 QR_IMAGE_URL = os.getenv(
     "QR_IMAGE_URL",
     "https://cdn.discordapp.com/attachments/1572106348022337677/1572260772615032913/"
@@ -456,7 +461,7 @@ async def create_ticket(interaction: discord.Interaction, kind: str, cat_id: int
         elif QR_IMAGE_URL:
             e.set_image(url=QR_IMAGE_URL)
         e.add_field(name="💳 ชำระเงิน",
-                    value="สแกน QR ด้านล่างเพื่อโอน แล้วส่งสลิปในห้องนี้", inline=False)
+                    value="สแกน QR ด้านล่างเพื่อโอน แล้วแนบรูปสลิปเป็นไฟล์รูปในห้องนี้ บอทจะส่งต่อให้ทีมงานตรวจสอบ", inline=False)
     e.set_footer(text="ปุ่มด้านล่างใช้รับเรื่อง/ปิดตั๋ว")
     await ch.send(content=f"{user.mention} {role.mention}", embed=e,
                   view=TicketControls(), **send_kwargs)
@@ -569,6 +574,121 @@ class TicketControls(discord.ui.View):
         await interaction.response.send_message("ต้องการปิดตั๋วนี้จริงหรือไม่?", view=ConfirmClose(), ephemeral=True)
 
 
+
+class SlipReviewButton(discord.ui.DynamicItem[discord.ui.Button],
+                       template=r"tk:slip:(?P<action>approve|reject):(?P<ticket>\d+)"):
+    """ปุ่มให้ทีมงานยืนยัน/ปฏิเสธสลิป โดยเก็บ ID ห้อง ticket ใน custom_id"""
+    def __init__(self, action: str, ticket_id: int):
+        self.action, self.ticket_id = action, ticket_id
+        if action == "approve":
+            label, style, emoji = "ยืนยันรับชำระแล้ว", discord.ButtonStyle.success, "✅"
+        else:
+            label, style, emoji = "ขอส่งสลิปใหม่", discord.ButtonStyle.danger, "❌"
+        super().__init__(discord.ui.Button(
+            label=label, style=style, emoji=emoji,
+            custom_id=f"tk:slip:{action}:{ticket_id}"))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(match["action"], int(match["ticket"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        ticket = interaction.guild.get_channel(self.ticket_id) if interaction.guild else None
+        info = parse_topic(ticket) if ticket else None
+        if not info or info.get("kind") != "order":
+            return await interaction.response.send_message(
+                "❌ ห้อง ticket ไม่พบหรือปิดไปแล้ว", ephemeral=True)
+        if not is_staff(interaction.user, info["role"]):
+            return await interaction.response.send_message(
+                "❌ เฉพาะทีมงานเท่านั้น", ephemeral=True)
+
+        if not interaction.message.embeds:
+            return await interaction.response.send_message(
+                "❌ ไม่พบข้อมูลสลิปในข้อความนี้", ephemeral=True)
+        e = discord.Embed.from_dict(interaction.message.embeds[0].to_dict())
+        old_footer = e.footer.text or ""
+        if old_footer.startswith("ผลตรวจ:"):
+            return await interaction.response.send_message(
+                "⚠️ สลิปนี้มีผลตรวจแล้ว", ephemeral=True)
+
+        if self.action == "approve":
+            status = f"ทีมงานยืนยันรับชำระแล้ว โดย {interaction.user.display_name}"
+            ticket_text = f"✅ ทีมงาน {interaction.user.mention} ตรวจสลิปและยืนยันว่าได้รับชำระแล้ว"
+        else:
+            status = f"ทีมงานขอให้ส่งสลิปใหม่ โดย {interaction.user.display_name}"
+            ticket_text = f"❌ ทีมงาน {interaction.user.mention} ขอให้ตรวจสอบและส่งสลิปใหม่อีกครั้ง"
+        e.set_footer(text=f"ผลตรวจ: {status}")
+
+        view = discord.ui.View(timeout=None)
+        view.add_item(discord.ui.Button(
+            label="ยืนยันรับชำระแล้ว", style=discord.ButtonStyle.success, emoji="✅",
+            custom_id=f"tk:slip:approve:{self.ticket_id}", disabled=True))
+        view.add_item(discord.ui.Button(
+            label="ขอส่งสลิปใหม่", style=discord.ButtonStyle.danger, emoji="❌",
+            custom_id=f"tk:slip:reject:{self.ticket_id}", disabled=True))
+        await interaction.response.edit_message(embed=e, view=view)
+        try:
+            await ticket.send(ticket_text)
+        except discord.HTTPException as ex:
+            print("slip decision ticket notification error:", repr(ex))
+
+
+class SlipReviewView(discord.ui.View):
+    def __init__(self, ticket_id: int):
+        super().__init__(timeout=None)
+        self.add_item(SlipReviewButton("approve", ticket_id))
+        self.add_item(SlipReviewButton("reject", ticket_id))
+
+
+class ReviewModal(discord.ui.Modal):
+    def __init__(self, destination_id: int):
+        super().__init__(title="เขียนรีวิว")
+        self.destination_id = destination_id
+        self.review_text = discord.ui.TextInput(
+            label="ข้อความรีวิว", placeholder="พิมพ์รีวิวของคุณที่นี่",
+            style=discord.TextStyle.paragraph, required=True, min_length=2,
+            max_length=1000)
+        self.add_item(self.review_text)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        channel = interaction.guild.get_channel(self.destination_id) if interaction.guild else None
+        if not isinstance(channel, discord.TextChannel):
+            return await interaction.response.send_message(
+                "❌ ไม่พบห้องสำหรับส่งรีวิว กรุณาแจ้งแอดมิน", ephemeral=True)
+        e = discord.Embed(
+            title="⭐ รีวิวใหม่",
+            description=self.review_text.value.strip(),
+            color=0xF1C40F, timestamp=dt.datetime.now(dt.timezone.utc))
+        e.add_field(name="ผู้รีวิว", value=f"{interaction.user.mention} (`{interaction.user.id}`)",
+                    inline=False)
+        e.set_author(name=interaction.user.display_name,
+                     icon_url=interaction.user.display_avatar.url)
+        try:
+            await channel.send(embed=e)
+        except discord.HTTPException as ex:
+            print("review send error:", repr(ex))
+            return await interaction.response.send_message(
+                "❌ ส่งรีวิวไม่สำเร็จ กรุณาลองใหม่หรือติดต่อแอดมิน", ephemeral=True)
+        await interaction.response.send_message("✅ ส่งรีวิวเรียบร้อย ขอบคุณมากครับ/ค่ะ", ephemeral=True)
+
+
+class ReviewPanelButton(discord.ui.DynamicItem[discord.ui.Button],
+                        template=r"review:submit:(?P<destination>\d+)"):
+    """ปุ่มเปิดฟอร์มรีวิว โดยเก็บ ID ห้องปลายทางใน custom_id"""
+    def __init__(self, destination_id: int):
+        self.destination_id = destination_id
+        super().__init__(discord.ui.Button(
+            label="เขียนรีวิว", style=discord.ButtonStyle.primary, emoji="⭐",
+            custom_id=f"review:submit:{destination_id}"))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(int(match["destination"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(ReviewModal(self.destination_id))
+
+
 class TicketModal(discord.ui.Modal):
     def __init__(self, kind: str, cat: int, role: int, log: int):
         super().__init__(title=KINDS[kind]["modal"])
@@ -658,6 +778,38 @@ async def ticket_panel(interaction: discord.Interaction,
         f"ห้องแจ้งเตือน: <#{log_id}>", ephemeral=True)
 
 
+
+@tree.command(name="review_panel", description="สร้างแผงให้สมาชิกส่งรีวิว", guild=G)
+@app_commands.describe(
+    panel_channel="ห้องที่จะวางแผงรีวิว",
+    review_channel="ห้องที่จะรับข้อความรีวิว",
+    title="หัวข้อบนแผง (ไม่ใส่ = ใช้ค่าเริ่มต้น)",
+    description="คำอธิบายบนแผง (ไม่ใส่ = ใช้ค่าเริ่มต้น)")
+@app_commands.default_permissions(administrator=True)
+async def review_panel(interaction: discord.Interaction,
+                       panel_channel: discord.TextChannel,
+                       review_channel: discord.TextChannel,
+                       title: str | None = None,
+                       description: str | None = None):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ เฉพาะแอดมินเท่านั้น", ephemeral=True)
+    e = discord.Embed(
+        title=title or "⭐ รีวิวจากลูกค้า",
+        description=description or "กดปุ่มด้านล่างเพื่อเขียนรีวิว ข้อความจะถูกส่งไปยังห้องรีวิว",
+        color=0x5865F2)
+    try:
+        await panel_channel.send(embed=e, view=ReviewPanelButton(review_channel.id))
+    except discord.Forbidden:
+        return await interaction.response.send_message(
+            f"❌ บอทส่งข้อความใน {panel_channel.mention} ไม่ได้", ephemeral=True)
+    except discord.HTTPException as ex:
+        print("review panel error:", repr(ex))
+        return await interaction.response.send_message("❌ สร้างแผงรีวิวไม่สำเร็จ", ephemeral=True)
+    await interaction.response.send_message(
+        f"✅ สร้างแผงใน {panel_channel.mention} แล้ว; รีวิวจะส่งไป {review_channel.mention}",
+        ephemeral=True)
+
+
 @tree.command(name="tickets", description="ดูรายการ ticket ที่เปิดอยู่ทั้งหมด", guild=G)
 @app_commands.default_permissions(manage_channels=True)
 async def tickets_cmd(interaction: discord.Interaction):
@@ -698,6 +850,63 @@ async def ticket_remove(interaction: discord.Interaction, member: discord.Member
     await interaction.response.send_message(f"➖ เอา {member.mention} ออกจาก ticket แล้ว")
 
 
+
+@client.event
+async def on_message(message: discord.Message):
+    """รับรูปจากเจ้าของ order ticket แล้วส่งสำเนาไปให้ทีมงานตรวจ"""
+    if message.author.bot or not isinstance(message.channel, discord.TextChannel):
+        return
+    info = parse_topic(message.channel)
+    if not info or info.get("kind") != "order" or message.author.id != info["opener"]:
+        return
+
+    attachments = [a for a in message.attachments
+                   if (a.content_type or "").lower().startswith("image/")
+                   or a.filename.lower().endswith(IMAGE_EXTENSIONS)]
+    if not attachments:
+        return
+    if any(a.size > MAX_SLIP_BYTES for a in attachments):
+        return await message.channel.send(
+            f"❌ รูปสลิปต้องมีขนาดไม่เกิน {MAX_SLIP_BYTES // (1024 * 1024)} MB ต่อรูป กรุณาส่งใหม่")
+    if len(attachments) > MAX_SLIP_FILES or sum(a.size for a in attachments) > MAX_SLIP_TOTAL_BYTES:
+        return await message.channel.send(
+            f"❌ ส่งได้ไม่เกิน {MAX_SLIP_FILES} รูป และรวมกันไม่เกิน {MAX_SLIP_TOTAL_BYTES // (1024 * 1024)} MB ต่อครั้ง")
+
+    log_ch = message.guild.get_channel(info["log"]) if message.guild else None
+    if log_ch is None and message.guild:
+        try:
+            log_ch = await message.guild.fetch_channel(info["log"])
+        except discord.HTTPException:
+            log_ch = None
+    if not isinstance(log_ch, discord.TextChannel):
+        return await message.channel.send("❌ ไม่พบห้องทีมงานสำหรับตรวจสลิป กรุณาแจ้งแอดมิน")
+
+    files = []
+    try:
+        for attachment in attachments:
+            files.append(await attachment.to_file())
+        e = discord.Embed(
+            title="💳 ได้รับรูปสลิปเพื่อให้ทีมงานตรวจ",
+            description=f"ผู้ส่ง: {message.author.mention} (`{message.author.id}`)\n"
+                        f"Ticket: {message.channel.mention}",
+            color=0xF1C40F, timestamp=dt.datetime.now(dt.timezone.utc))
+        e.set_footer(text="ผลตรวจจะอ้างอิงการพิจารณาของทีมงาน ไม่ใช่การตรวจสอบอัตโนมัติจากธนาคาร")
+        await log_ch.send(
+            content=f"<@&{info['role']}>", embed=e, files=files,
+            view=SlipReviewView(message.channel.id),
+            allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False))
+        await message.channel.send("✅ ส่งรูปสลิปให้ทีมงานตรวจแล้ว กรุณารอผลใน ticket นี้")
+    except discord.HTTPException as ex:
+        print("slip forwarding error:", repr(ex))
+        await message.channel.send("❌ ส่งรูปสลิปให้ทีมงานไม่สำเร็จ กรุณาแจ้งทีมงานใน ticket นี้")
+    finally:
+        for f in files:
+            try:
+                f.close()
+            except Exception:
+                pass
+
+
 _ticket_ready = False
 
 
@@ -705,7 +914,7 @@ _ticket_ready = False
 async def on_ready():
     global session, _ticket_ready
     if not _ticket_ready:                      # ให้ปุ่มเก่ายังใช้ได้หลังบอทรีสตาร์ท
-        client.add_dynamic_items(OpenTicketButton)
+        client.add_dynamic_items(OpenTicketButton, SlipReviewButton, ReviewPanelButton)
         client.add_view(TicketControls())
         _ticket_ready = True
     if session is None:
@@ -715,6 +924,8 @@ async def on_ready():
         watcher.start()
     if WATCH_EVENTS and not events_watcher.is_running():
         events_watcher.start()
+    if not intents.message_content:
+        print("[ticket] เปิด Message Content Intent ใน Discord Developer Portal และตั้ง ENABLE_MESSAGE_CONTENT=1 เพื่อให้บอทตรวจพบไฟล์แนบใน ticket")
     print(f"Logged in as {client.user}")
 
 
