@@ -269,7 +269,7 @@ async def chekstock(interaction: discord.Interaction):
         rows = await fetch_all(KEYS_TABLE)
         detect_schema(rows)
         n = sum(1 for r in rows if not is_revoked(r) and not is_sold(r))
-        await interaction.followup.send(f"📦 คีย์ที่ยังไม่ถูกขายเหลือ **{n}** คีย์ (จากทั้งหมด {len(rows)})")
+        await interaction.followup.send(f"📦 จำนวนสินค้าเหลือ **{n}** คีย์ (จากทั้งหมด {len(rows)})")
     except Exception as ex:
         print("stock error:", repr(ex))
         await interaction.followup.send("❌ ดึงข้อมูลสต็อกไม่สำเร็จ")
