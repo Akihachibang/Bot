@@ -86,6 +86,9 @@ first_run = True
 events_seen: set | None = None
 schema: dict = {}
 review_counts: dict[int, int] = {}
+TOPIC_SYNC_COOLDOWN_SECONDS = 360  # Discord กลับมาอนุญาต PATCH หลัง retry_after พร้อม buffer
+review_topic_pending_at: dict[int, float] = {}
+review_topic_tasks: dict[int, asyncio.Task] = {}
 
 
 # ---------- ตัวช่วย ----------
@@ -670,15 +673,74 @@ async def ensure_review_topic_counter(channel: discord.TextChannel) -> int:
         return 0
 
 
+async def count_review_posts(channel: discord.TextChannel) -> int:
+    """นับรีวิวจากข้อความที่บอทส่งไว้ ใช้กู้จำนวนหลัง Railway รีสตาร์ต"""
+    if not client.user:
+        return 0
+    total = 0
+    async for message in channel.history(limit=None, oldest_first=True):
+        if message.author.id == client.user.id and any(
+            embed.title == "⭐ รีวิวใหม่" for embed in message.embeds
+        ):
+            total += 1
+    return total
+
+
+def queue_review_topic_sync(channel: discord.TextChannel):
+    """รวมการแก้ Topic ให้ไม่เกินหนึ่งครั้งต่อช่วง cooldown"""
+    loop = asyncio.get_running_loop()
+    channel_id = channel.id
+    review_topic_pending_at[channel_id] = loop.time()
+    task = review_topic_tasks.get(channel_id)
+    if task is None or task.done():
+        review_topic_tasks[channel_id] = asyncio.create_task(_delayed_review_topic_sync(channel))
+
+
+async def _delayed_review_topic_sync(channel: discord.TextChannel):
+    channel_id = channel.id
+    try:
+        while channel_id in review_topic_pending_at:
+            loop = asyncio.get_running_loop()
+            requested_at = review_topic_pending_at[channel_id]
+            await asyncio.sleep(max(0, requested_at + TOPIC_SYNC_COOLDOWN_SECONDS - loop.time()))
+            if review_topic_pending_at.get(channel_id) != requested_at:
+                continue  # มีรีวิวใหม่ ให้รอครบ cooldown นับจากครั้งล่าสุด
+            try:
+                count = await count_review_posts(channel)
+                topic = channel.topic or ""
+                match = REVIEW_TOPIC_RE.search(topic)
+                old_count = int(match.group(1)) if match else None
+                if old_count != count:
+                    await channel.edit(
+                        topic=format_review_topic(topic, count),
+                        reason="อัปเดตจำนวนรีวิวแบบจำกัดความถี่")
+                review_counts[channel_id] = count
+                print(f"[review] topic synced: channel={channel_id}, count={count}")
+            except Exception as ex:
+                print(f"review topic sync error (channel={channel_id}):", repr(ex))
+                # ถ้า Discord ยังจำกัดอยู่ ให้รออีกหนึ่งรอบ cooldown ก่อนลองใหม่
+                review_topic_pending_at[channel_id] = loop.time()
+                continue
+            if review_topic_pending_at.get(channel_id) == requested_at:
+                review_topic_pending_at.pop(channel_id, None)
+                return
+    finally:
+        if review_topic_tasks.get(channel_id) is asyncio.current_task():
+            review_topic_tasks.pop(channel_id, None)
+
+
 async def increment_review_topic_counter(channel: discord.TextChannel) -> int:
     async with review_topic_lock:
-        topic = channel.topic or ""
-        match = REVIEW_TOPIC_RE.search(topic)
-        count = review_counts.get(channel.id, int(match.group(1)) if match else 0) + 1
-        await channel.edit(topic=format_review_topic(topic, count),
-                           reason="อัปเดตจำนวนรีวิวที่ได้รับ")
+        count = review_counts.get(channel.id)
+        if count is None:
+            # Topic อาจยังไม่ทัน sync ก่อน Railway รีสตาร์ต; recount จากรีวิวจริง
+            count = await count_review_posts(channel)
+        else:
+            count += 1
         review_counts[channel.id] = count
+        queue_review_topic_sync(channel)
         return count
+
 
 
 class ReviewModal(discord.ui.Modal):
@@ -993,6 +1055,11 @@ async def on_ready():
         watcher.start()
     if WATCH_EVENTS and not events_watcher.is_running():
         events_watcher.start()
+    # กู้ Topic ที่อาจค้างก่อน Railway รีสตาร์ต โดยยังเคารพ cooldown ของ Discord
+    for guild in client.guilds:
+        for ch in guild.text_channels:
+            if REVIEW_TOPIC_RE.search(ch.topic or ""):
+                queue_review_topic_sync(ch)
     if not intents.message_content:
         print("[ticket] เปิด Message Content Intent ใน Discord Developer Portal และตั้ง ENABLE_MESSAGE_CONTENT=1 เพื่อให้บอทตรวจพบไฟล์แนบใน ticket")
     print(f"Logged in as {client.user}")
