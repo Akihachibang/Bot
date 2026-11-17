@@ -166,6 +166,37 @@ def make_embed(title: str, color: int, row: dict, extra: str = "") -> discord.Em
     return e
 
 
+def deleted_embed(row: dict) -> discord.Embed:
+    """แจ้งลบคีย์ พร้อมข้อมูลครบทุกคอลัมน์ของแถวที่ถูกลบ"""
+    if is_revoked(row):
+        state = "⛔ ถูกยกเลิกอยู่"
+    elif is_sold(row):
+        state = "💰 ขายแล้ว/ถูกใช้งานแล้ว"
+    else:
+        state = "📦 ยังอยู่ใน Stock (ยังไม่ขาย)"
+
+    e = discord.Embed(title="🗑️ ลบคีย์ออกจากระบบ", color=0x95A5A6,
+                      timestamp=dt.datetime.now(dt.timezone.utc))
+    kc = schema.get("key") or schema.get("id")
+    e.add_field(name="Key (เต็ม)", value=f"`{row.get(kc)}`", inline=False)
+    e.add_field(name="สถานะก่อนลบ", value=state, inline=True)
+    hw = schema.get("hwid")
+    if hw:
+        e.add_field(name="HWID ที่ผูกอยู่",
+                    value=f"`{row.get(hw)}`" if row.get(hw) else "ยังไม่ผูก", inline=True)
+
+    lines = []
+    for c, v in row.items():
+        if v in (None, ""):
+            continue
+        lines.append(f"**{c}**: {str(v)[:150]}")
+    e.add_field(name="ข้อมูลทั้งหมดของคีย์นี้",
+                value=("\n".join(lines) or "-")[:1000], inline=False)
+    e.set_footer(text="ระบบตรวจพบว่าแถวนี้หายไปจากตาราง "
+                      "(ไม่ทราบผู้ลบ) เวลาตรวจพบตามข้างบน")
+    return e
+
+
 async def notify(e: discord.Embed):
     ch = client.get_channel(LOG_CHANNEL_ID) or await client.fetch_channel(LOG_CHANNEL_ID)
     await ch.send(embed=e)
@@ -221,7 +252,7 @@ async def watcher():
 
         for rid, old in snapshot.items():
             if rid not in current:
-                await notify(make_embed("🗑️ ลบคีย์", 0x95A5A6, old))
+                await notify(deleted_embed(old))
 
         snapshot = current
     except Exception as ex:
@@ -269,7 +300,7 @@ async def chekstock(interaction: discord.Interaction):
         rows = await fetch_all(KEYS_TABLE)
         detect_schema(rows)
         n = sum(1 for r in rows if not is_revoked(r) and not is_sold(r))
-        await interaction.followup.send(f"📦 จำนวนสินค้าเหลือ **{n}** คีย์ (จากทั้งหมด {len(rows)})")
+        await interaction.followup.send(f"📦 สินค้าใน Stock เหลือ **{n}** คีย์ (จากทั้งหมด {len(rows)})")
     except Exception as ex:
         print("stock error:", repr(ex))
         await interaction.followup.send("❌ ดึงข้อมูลสต็อกไม่สำเร็จ")
