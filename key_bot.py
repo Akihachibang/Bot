@@ -85,6 +85,7 @@ snapshot: dict = {}
 first_run = True
 events_seen: set | None = None
 schema: dict = {}
+review_counts: dict[int, int] = {}
 
 
 # ---------- ตัวช่วย ----------
@@ -640,6 +641,46 @@ class SlipReviewView(discord.ui.View):
         self.add_item(SlipReviewButton("reject", ticket_id))
 
 
+REVIEW_TOPIC_RE = re.compile(r"เครดิต\s*[:：]\s*(\d+)")
+review_topic_lock = asyncio.Lock()
+
+
+def format_review_topic(topic: str, count: int) -> str:
+    """แทน/เพิ่มตัวนับเครดิตใน Topic โดยคงข้อความอื่นและไม่เกิน 1024 ตัวอักษร"""
+    marker = f"เครดิต: {count}"
+    match = REVIEW_TOPIC_RE.search(topic)
+    if match:
+        return topic[:match.start()] + marker + topic[match.end():]
+    separator = " | " if topic.strip() else ""
+    room = max(0, 1024 - len(separator) - len(marker))
+    return topic[:room].rstrip() + separator + marker
+
+
+async def ensure_review_topic_counter(channel: discord.TextChannel) -> int:
+    async with review_topic_lock:
+        topic = channel.topic or ""
+        match = REVIEW_TOPIC_RE.search(topic)
+        if match:
+            count = int(match.group(1))
+            review_counts[channel.id] = count
+            return count
+        await channel.edit(topic=format_review_topic(topic, 0),
+                           reason="ตั้งตัวนับจำนวนเครดิตรีวิว")
+        review_counts[channel.id] = 0
+        return 0
+
+
+async def increment_review_topic_counter(channel: discord.TextChannel) -> int:
+    async with review_topic_lock:
+        topic = channel.topic or ""
+        match = REVIEW_TOPIC_RE.search(topic)
+        count = review_counts.get(channel.id, int(match.group(1)) if match else 0) + 1
+        await channel.edit(topic=format_review_topic(topic, count),
+                           reason="อัปเดตจำนวนรีวิวที่ได้รับ")
+        review_counts[channel.id] = count
+        return count
+
+
 class ReviewModal(discord.ui.Modal):
     def __init__(self, destination_id: int):
         super().__init__(title="เขียนรีวิว")
@@ -669,7 +710,15 @@ class ReviewModal(discord.ui.Modal):
             print("review send error:", repr(ex))
             return await interaction.response.send_message(
                 "❌ ส่งรีวิวไม่สำเร็จ กรุณาลองใหม่หรือติดต่อแอดมิน", ephemeral=True)
-        await interaction.response.send_message("✅ ส่งรีวิวเรียบร้อย ขอบคุณมากครับ/ค่ะ", ephemeral=True)
+        try:
+            count = await increment_review_topic_counter(channel)
+        except discord.HTTPException as ex:
+            print("review topic counter update error:", repr(ex))
+            return await interaction.response.send_message(
+                "✅ ส่งรีวิวแล้ว แต่ปรับ Topic ไม่สำเร็จ กรุณาให้บอทมีสิทธิ์ Manage Channels ในห้องรีวิว",
+                ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ ส่งรีวิวเรียบร้อย ขอบคุณมากครับ/ค่ะ (เครดิตรีวิว: {count})", ephemeral=True)
 
 
 class ReviewPanelButton(discord.ui.DynamicItem[discord.ui.Button],
@@ -793,6 +842,11 @@ async def review_panel(interaction: discord.Interaction,
                        description: str | None = None):
     if not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message("❌ เฉพาะแอดมินเท่านั้น", ephemeral=True)
+    bot_member = interaction.guild.me
+    if not review_channel.permissions_for(bot_member).manage_channels:
+        return await interaction.response.send_message(
+            f"❌ กรุณาให้บอทมีสิทธิ์ Manage Channels ใน {review_channel.mention} "
+            "เพื่อเขียนจำนวนรีวิวใน Channel Topic", ephemeral=True)
     e = discord.Embed(
         title=title or "⭐ รีวิวจากลูกค้า",
         description=description or "กดปุ่มด้านล่างเพื่อเขียนรีวิว ข้อความจะถูกส่งไปยังห้องรีวิว",
@@ -807,9 +861,16 @@ async def review_panel(interaction: discord.Interaction,
     except discord.HTTPException as ex:
         print("review panel error:", repr(ex))
         return await interaction.response.send_message("❌ สร้างแผงรีวิวไม่สำเร็จ", ephemeral=True)
+    try:
+        count = await ensure_review_topic_counter(review_channel)
+    except discord.HTTPException as ex:
+        print("review topic initialization error:", repr(ex))
+        return await interaction.response.send_message(
+            f"✅ สร้างแผงแล้ว แต่ตั้ง Topic ใน {review_channel.mention} ไม่สำเร็จ",
+            ephemeral=True)
     await interaction.response.send_message(
-        f"✅ สร้างแผงใน {panel_channel.mention} แล้ว; รีวิวจะส่งไป {review_channel.mention}",
-        ephemeral=True)
+        f"✅ สร้างแผงใน {panel_channel.mention} แล้ว; รีวิวจะส่งไป {review_channel.mention} "
+        f"(เครดิตรีวิวปัจจุบัน: {count})", ephemeral=True)
 
 
 @tree.command(name="tickets", description="ดูรายการ ticket ที่เปิดอยู่ทั้งหมด", guild=G)
