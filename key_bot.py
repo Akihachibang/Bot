@@ -37,6 +37,17 @@ EVENTS_TABLE = "license_events"
 WATCH_EVENTS = False   # True = แจ้งเตือนทุกแถวใหม่ในตาราง license_events ด้วย
 POLL_SECONDS = 10
 
+# รูป QR ชำระเงิน (แสดงใน ticket สั่งซื้อ)
+# ถ้ามีไฟล์ qr.png วางข้าง key_bot.py บอทจะใช้ไฟล์นี้ก่อน (ไม่มีวันหมดอายุ แนะนำวิธีนี้)
+# ถ้าไม่มี จะใช้ลิงก์ด้านล่าง (ลิงก์ Discord CDN มีวันหมดอายุ)
+QR_LOCAL_FILE = "qr.png"
+QR_IMAGE_URL = os.getenv(
+    "QR_IMAGE_URL",
+    "https://cdn.discordapp.com/attachments/1572106348022337677/1572260772615032913/"
+    "Instagram_Post_1.png?ex=6afdb973&is=6afc67f3&"
+    "hm=87d582dee30e43dac526fbfbf080cad9d47a7791c25668f65f98319720f7fc56&",
+)
+
 # ถ้าตรวจอัตโนมัติผิด ให้ใส่ชื่อคอลัมน์เองตรงนี้ (เว้นว่าง = ตรวจเอง)
 FORCE_ID_COL = ""
 FORCE_KEY_COL = ""
@@ -437,8 +448,18 @@ async def create_ticket(interaction: discord.Interaction, kind: str, cat_id: int
             e.add_field(name="📦 สินค้าใน Stock ตอนนี้", value=f"{await stock_count()} คีย์", inline=True)
         except Exception as ex:
             print("stock in ticket error:", repr(ex))
+    send_kwargs = {}
+    if kind == "order":
+        if os.path.isfile(QR_LOCAL_FILE):
+            send_kwargs["file"] = discord.File(QR_LOCAL_FILE, filename="qr.png")
+            e.set_image(url="attachment://qr.png")
+        elif QR_IMAGE_URL:
+            e.set_image(url=QR_IMAGE_URL)
+        e.add_field(name="💳 ชำระเงิน",
+                    value="สแกน QR ด้านล่างเพื่อโอน แล้วส่งสลิปในห้องนี้", inline=False)
     e.set_footer(text="ปุ่มด้านล่างใช้รับเรื่อง/ปิดตั๋ว")
-    await ch.send(content=f"{user.mention} {role.mention}", embed=e, view=TicketControls())
+    await ch.send(content=f"{user.mention} {role.mention}", embed=e,
+                  view=TicketControls(), **send_kwargs)
 
     log_ch = guild.get_channel(log_id)
     if log_ch:
@@ -592,7 +613,8 @@ class OpenTicketButton(discord.ui.DynamicItem[discord.ui.Button],
     log_channel="ห้องแจ้งเตือนเมื่อมี ticket ใหม่ (ไม่เลือก = ห้องแจ้งเตือนหลักของบอท)",
     title="หัวข้อบนแผง (ไม่ใส่ = ใช้ค่าเริ่มต้น)",
     description="ข้อความอธิบายบนแผง (ไม่ใส่ = ใช้ค่าเริ่มต้น)",
-    include_help="แสดงปุ่ม สอบถาม/แจ้งปัญหา ด้วย")
+    include_help="แสดงปุ่ม สอบถาม/แจ้งปัญหา ด้วย",
+    image="ลิงก์รูปหรือ GIF ที่จะโชว์บนแผง (ขึ้นต้นด้วย https://)")
 @app_commands.default_permissions(administrator=True)
 async def ticket_panel(interaction: discord.Interaction,
                        channel: discord.TextChannel,
@@ -601,7 +623,11 @@ async def ticket_panel(interaction: discord.Interaction,
                        log_channel: discord.TextChannel | None = None,
                        title: str | None = None,
                        description: str | None = None,
-                       include_help: bool = True):
+                       include_help: bool = True,
+                       image: str | None = None):
+    if image and not re.match(r"^https?://\S+$", image.strip()):
+        return await interaction.response.send_message(
+            "❌ ลิงก์รูปต้องขึ้นต้นด้วย http:// หรือ https:// และไม่มีช่องว่าง", ephemeral=True)
     me = interaction.guild.me
     if not category.permissions_for(me).manage_channels:
         return await interaction.response.send_message(
@@ -615,6 +641,8 @@ async def ticket_panel(interaction: discord.Interaction,
                                     "❓ **สอบถาม/แจ้งปัญหา** ติดต่อทีมงานได้โดยตรง\n\n"
                                     "*1 คนเปิดได้ครั้งละ 1 ticket*"),
         color=0x5865F2)
+    if image:
+        e.set_image(url=image.strip())
     view = discord.ui.View(timeout=None)
     view.add_item(OpenTicketButton("order", category.id, staff_role.id, log_id))
     if include_help:
