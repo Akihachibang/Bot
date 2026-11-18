@@ -14,6 +14,7 @@ import re
 import json
 import asyncio
 import datetime as dt
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import discord
@@ -36,6 +37,9 @@ KEYS_TABLE = "license_keys"
 EVENTS_TABLE = "license_events"
 WATCH_EVENTS = False   # True = แจ้งเตือนทุกแถวใหม่ในตาราง license_events ด้วย
 POLL_SECONDS = 10
+SHOP_TIMEZONE = ZoneInfo("Asia/Bangkok")
+SHOP_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shop_hours.json")
+SHOP_CONFIGS: dict[str, dict] = {}
 
 # รูป QR ชำระเงิน (แสดงใน ticket สั่งซื้อ)
 # ถ้ามีไฟล์ qr.png วางข้าง key_bot.py บอทจะใช้ไฟล์นี้ก่อน (ไม่มีวันหมดอายุ แนะนำวิธีนี้)
@@ -313,6 +317,159 @@ async def events_watcher():
         events_seen = ids
     except Exception as ex:
         print("events error:", repr(ex))
+
+
+# ---------- สถานะเวลาเปิด-ปิดร้าน ----------
+def load_shop_configs():
+    """โหลดเวลาเปิด-ปิดและห้องแจ้งเตือนจากไฟล์ เพื่อให้คงอยู่หลังรีสตาร์ต"""
+    global SHOP_CONFIGS
+    try:
+        with open(SHOP_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        SHOP_CONFIGS = data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        SHOP_CONFIGS = {}
+    except (OSError, json.JSONDecodeError) as ex:
+        print("shop config load error:", repr(ex))
+        SHOP_CONFIGS = {}
+
+
+def save_shop_configs():
+    temp_path = SHOP_CONFIG_PATH + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(SHOP_CONFIGS, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, SHOP_CONFIG_PATH)
+
+
+load_shop_configs()
+
+
+def shop_is_open(config: dict, now: dt.datetime | None = None) -> bool:
+    now = (now or dt.datetime.now(SHOP_TIMEZONE)).astimezone(SHOP_TIMEZONE)
+    open_at = dt.datetime.strptime(config["open_time"], "%H:%M").time()
+    close_at = dt.datetime.strptime(config["close_time"], "%H:%M").time()
+    current = now.time().replace(tzinfo=None)
+    if open_at < close_at:
+        return open_at <= current < close_at
+    # รองรับเวลาทำการข้ามเที่ยงคืน เช่น 20:00 ถึง 02:00
+    return current >= open_at or current < close_at
+
+
+def shop_status_message(config: dict, is_open: bool) -> str:
+    if is_open:
+        return (f"🟢 **ร้านเปิดให้บริการแล้ว**\n"
+                f"เวลาเปิด `{config['open_time']}` น. · ปิด `{config['close_time']}` น.")
+    return (f"🔴 **ร้านปิดให้บริการแล้ว**\n"
+            f"เวลาเปิด `{config['open_time']}` น. · ปิด `{config['close_time']}` น.")
+
+
+LAST_SHOP_PRESENCE_STATUS: str | None = None
+
+
+async def update_shop_presence(config: dict, force: bool = False):
+    """ตั้ง activity ของบอทตามเวลาเปิด-ปิด โดยใช้เวลาประเทศไทย"""
+    global LAST_SHOP_PRESENCE_STATUS
+    is_open = shop_is_open(config)
+    status = "open" if is_open else "closed"
+    if not force and LAST_SHOP_PRESENCE_STATUS == status:
+        return
+
+    label = "เปิด🟢" if is_open else "ปิด🔴"
+    await client.change_presence(
+        status=discord.Status.online,
+        activity=discord.Game(name=label),
+    )
+    LAST_SHOP_PRESENCE_STATUS = status
+
+
+@tasks.loop(seconds=30)
+async def shop_status_watcher():
+    """ตรวจสถานะทุก 30 วินาที อัปเดต activity และแจ้งเมื่อร้านเปลี่ยนสถานะ"""
+    presence_config = SHOP_CONFIGS.get(str(GUILD_ID))
+    if presence_config:
+        try:
+            await update_shop_presence(presence_config)
+        except Exception as ex:
+            print("shop presence update error:", repr(ex))
+
+    changed = False
+    for guild_id, config in list(SHOP_CONFIGS.items()):
+        try:
+            channel_id = int(config["channel_id"])
+            is_open = shop_is_open(config)
+            status = "open" if is_open else "closed"
+            if config.get("last_status") == status:
+                continue
+
+            channel = client.get_channel(channel_id)
+            if channel is None:
+                channel = await client.fetch_channel(channel_id)
+            await channel.send(shop_status_message(config, is_open))
+            config["last_status"] = status
+            changed = True
+        except discord.NotFound:
+            print(f"shop status channel not found: guild={guild_id}")
+        except discord.Forbidden:
+            print(f"shop status send forbidden: guild={guild_id}")
+        except Exception as ex:
+            print(f"shop status error (guild={guild_id}):", repr(ex))
+    if changed:
+        save_shop_configs()
+
+
+@tree.command(name="settime", description="ตั้งเวลาเปิด-ปิดร้านและห้องแจ้งเตือน",
+              guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(
+    open_time="เวลาเปิดร้าน รูปแบบ 24 ชั่วโมง เช่น 09:00",
+    close_time="เวลาปิดร้าน รูปแบบ 24 ชั่วโมง เช่น 18:30",
+    channel="ห้องที่จะประกาศสถานะร้าน",
+)
+@app_commands.default_permissions(administrator=True)
+async def settime(interaction: discord.Interaction, open_time: str, close_time: str,
+                  channel: discord.TextChannel):
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", open_time.strip()):
+        return await interaction.response.send_message(
+            "❌ เวลาเปิดไม่ถูกต้อง กรุณาใช้รูปแบบ `HH:MM` เช่น `09:00`", ephemeral=True)
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", close_time.strip()):
+        return await interaction.response.send_message(
+            "❌ เวลาปิดไม่ถูกต้อง กรุณาใช้รูปแบบ `HH:MM` เช่น `18:30`", ephemeral=True)
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ ใช้คำสั่งนี้ในเซิร์ฟเวอร์เท่านั้น", ephemeral=True)
+
+    open_time, close_time = open_time.strip(), close_time.strip()
+    if open_time == close_time:
+        return await interaction.response.send_message(
+            "❌ เวลาเปิดและเวลาปิดต้องไม่ตรงกัน", ephemeral=True)
+    bot_member = interaction.guild.me
+    if bot_member is None or not channel.permissions_for(bot_member).send_messages:
+        return await interaction.response.send_message(
+            f"❌ บอทไม่มีสิทธิ์ส่งข้อความใน {channel.mention}", ephemeral=True)
+
+    config = {
+        "open_time": open_time,
+        "close_time": close_time,
+        "channel_id": channel.id,
+    }
+    status_now = shop_is_open(config)
+    config["last_status"] = "open" if status_now else "closed"
+    SHOP_CONFIGS[str(interaction.guild.id)] = config
+    await interaction.response.defer(ephemeral=True)
+    try:
+        save_shop_configs()
+        await channel.send(shop_status_message(config, status_now))
+        if str(interaction.guild.id) == str(GUILD_ID):
+            try:
+                await update_shop_presence(config, force=True)
+            except Exception as presence_ex:
+                print("shop presence update error:", repr(presence_ex))
+    except (OSError, discord.HTTPException) as ex:
+        print("settime error:", repr(ex))
+        return await interaction.followup.send(
+            "❌ บันทึกการตั้งค่าหรือส่งประกาศไม่สำเร็จ ตรวจสอบสิทธิ์บอทและลองอีกครั้ง", ephemeral=True)
+
+    await interaction.followup.send(
+        f"✅ ตั้งเวลาแล้ว (เวลาไทย): เปิด `{open_time}` · ปิด `{close_time}`\n"
+        f"จะแจ้งสถานะใน {channel.mention} เมื่อร้านเปิดหรือปิด", ephemeral=True)
 
 
 # ---------- คำสั่ง ----------
@@ -1055,6 +1212,14 @@ async def on_ready():
         watcher.start()
     if WATCH_EVENTS and not events_watcher.is_running():
         events_watcher.start()
+    if not shop_status_watcher.is_running():
+        shop_status_watcher.start()
+    presence_config = SHOP_CONFIGS.get(str(GUILD_ID))
+    if presence_config:
+        try:
+            await update_shop_presence(presence_config, force=True)
+        except Exception as ex:
+            print("shop presence update error:", repr(ex))
     # กู้ Topic ที่อาจค้างก่อน Railway รีสตาร์ต โดยยังเคารพ cooldown ของ Discord
     for guild in client.guilds:
         for ch in guild.text_channels:
