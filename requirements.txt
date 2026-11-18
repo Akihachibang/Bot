@@ -1,3 +1,5 @@
-discord.py>=2.4
-aiohttp
-python-dotenv
+discord.py[voice]>=2.4,<3
+aiohttp>=3.9,<4
+python-dotenv>=1,<2
+yt-dlp
+Pillow>=10,<13
