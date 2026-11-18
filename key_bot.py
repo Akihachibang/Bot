@@ -3,26 +3,35 @@ Discord Key Bot (v2 - ตรวจชื่อคอลัมน์อัตโ�
 แจ้งเตือน: สร้างคีย์ / รีเซ็ต HWID / ผูก HWID / ยกเลิกคีย์ / ลบคีย์ / แก้ไขคีย์
 คำสั่ง: /chekstock , /downdownload
 
-ติดตั้ง:  pip install discord.py aiohttp python-dotenv
+ติดตั้ง:  pip install "discord.py[voice]" aiohttp python-dotenv yt-dlp Pillow
+ต้องติดตั้ง FFmpeg ในเครื่อง/เซิร์ฟเวอร์ด้วย (ต้องอยู่ใน PATH)
 .env:
     DISCORD_TOKEN=...
     SUPABASE_URL=https://cgsuxxyezqhxayllhzfs.supabase.co
     SUPABASE_KEY=...
-    ENABLE_MESSAGE_CONTENT=1          # จำเป็น: ให้บอทเห็นรูปสลิปที่แนบใน ticket
+    ENABLE_MESSAGE_CONTENT=1          # เปิดใน Developer Portal ด้วย: ใช้ตรวจลิงก์/ข้อความและ ticket
     SLIP2GO_SECRET=...                # Secret Key จากหน้า API Connect > Authentication ของ Slip2Go
     RECEIVER_PHONE=0XXXXXXXXX         # เบอร์พร้อมเพย์/TrueMoney ที่รับเงิน (ใช้เช็คว่าสลิปโอนเข้าบัญชีเรา)
+    DISCORD_CLIENT_ID=...             # OAuth2 app สำหรับระบบยินยอมเข้าร่วมเซิร์ฟเวอร์
+    DISCORD_CLIENT_SECRET=...
+    OAUTH_REDIRECT_URI=https://โดเมนของคุณ/oauth/callback
+    OAUTH_PUBLIC_URL=https://โดเมนของคุณ
+    OAUTH_GUILD_ID=...                # Server ID เป้าหมาย (ต้องตรงกับเซิร์ฟเวอร์ที่ให้เข้าร่วม)
 """
 import os
 import re
+import math
+import secrets
 import json
 import asyncio
 import base64
 import io
 import datetime as dt
 from zoneinfo import ZoneInfo
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 
 import aiohttp
+from aiohttp import web
 import discord
 from discord import app_commands
 from discord.ext import tasks
@@ -110,6 +119,7 @@ IGNORE_CHANGE = {"updated_at", "ip", "last_ip", "last_seen", "last_used",
                  "last_check", "last_login"}
 
 intents = discord.Intents.default()
+intents.bans = True
 # เปิดเป็น 1 เมื่อเปิด "Message Content Intent" ใน Developer Portal แล้ว (ใช้เก็บข้อความใน transcript)
 intents.message_content = os.getenv("ENABLE_MESSAGE_CONTENT") == "1"
 client = discord.Client(intents=intents)
@@ -1170,6 +1180,626 @@ async def ticket_remove(interaction: discord.Interaction, member: discord.Member
 
 
 
+# ================= ระบบความปลอดภัย / เพลง / OAuth =================
+# การตั้งค่าของ moderation เก็บแยกจาก shop_hours.json
+MOD_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moderation_settings.json")
+BLOCKED_IMAGE_PHASH_DEFAULT = "a552cdb1cc52d62b"  # fingerprint รูปแนบที่ผู้ดูแลต้องการบล็อก
+BLOCKED_IMAGE_DISTANCE = int(os.getenv("BLOCKED_IMAGE_DISTANCE", "6"))
+LINK_RE = re.compile(
+    r"(?i)(?:https?://|www\d?\.)\S+|(?<![@\w])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"(?:com|net|org|edu|gov|io|gg|co|me|dev|app|xyz|info|biz|shop|online|ru|cn)"
+    r"(?::\d+)?(?:/[^\s]*)?"
+)
+MOD_CONFIGS: dict[str, dict] = {}
+
+
+def load_mod_configs():
+    global MOD_CONFIGS
+    try:
+        with open(MOD_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        MOD_CONFIGS = data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        MOD_CONFIGS = {}
+    except (OSError, json.JSONDecodeError) as ex:
+        print("moderation config load error:", repr(ex))
+        MOD_CONFIGS = {}
+
+
+def save_mod_configs():
+    tmp = MOD_CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(MOD_CONFIGS, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, MOD_CONFIG_PATH)
+
+
+def mod_config(guild_id: int) -> dict:
+    cfg = MOD_CONFIGS.setdefault(str(guild_id), {})
+    cfg.setdefault("avatar_role_ids", [])
+    cfg.setdefault("link_exempt_role_ids", [])
+    cfg.setdefault("log_channel_id", None)
+    cfg.setdefault("links_enabled", False)
+    cfg.setdefault("images_enabled", True)
+    cfg.setdefault("blocked_image_phash", BLOCKED_IMAGE_PHASH_DEFAULT)
+    return cfg
+
+
+load_mod_configs()
+
+
+def image_phash(raw: bytes) -> str:
+    """64-bit perceptual hash (DCT) to match resized/recompressed copies."""
+    from PIL import Image
+    with Image.open(io.BytesIO(raw)) as source:
+        if source.width * source.height > 20_000_000:
+            raise ValueError("image dimensions exceed scan limit")
+        img = source.convert("L").resize((32, 32))
+    px = [[img.getpixel((x, y)) for x in range(32)] for y in range(32)]
+    cos_x = [[math.cos((2 * x + 1) * u * math.pi / 64) for x in range(32)] for u in range(8)]
+    cos_y = [[math.cos((2 * y + 1) * v * math.pi / 64) for y in range(32)] for v in range(8)]
+    coeffs = []
+    for v in range(8):
+        for u in range(8):
+            total = sum(px[y][x] * cos_x[u][x] * cos_y[v][y]
+                        for y in range(32) for x in range(32))
+            total *= (1 / math.sqrt(2) if u == 0 else 1) * (1 / math.sqrt(2) if v == 0 else 1)
+            coeffs.append(total)
+    median = sorted(coeffs[1:])[len(coeffs[1:]) // 2]
+    value = 0
+    for c in coeffs:
+        value = (value << 1) | (1 if c > median else 0)
+    return f"{value:016x}"
+
+
+def hamming_hex(a: str, b: str) -> int:
+    try:
+        return (int(a, 16) ^ int(b, 16)).bit_count()
+    except (TypeError, ValueError):
+        return 64
+
+
+async def find_mod_log_channel(guild: discord.Guild):
+    cid = mod_config(guild.id).get("log_channel_id") or LOG_CHANNEL_ID
+    channel = guild.get_channel(int(cid)) if cid else None
+    if channel is None and cid:
+        try:
+            channel = await guild.fetch_channel(int(cid))
+        except (discord.HTTPException, ValueError):
+            return None
+    return channel if isinstance(channel, discord.TextChannel) else None
+
+
+async def send_mod_log(guild: discord.Guild, embed: discord.Embed):
+    channel = await find_mod_log_channel(guild)
+    if channel is None:
+        print(f"moderation log channel not found: guild={guild.id}")
+        return
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException as ex:
+        print("moderation log send error:", repr(ex))
+
+
+def member_has_role_id(member: discord.Member, role_ids: list) -> bool:
+    ids = {int(x) for x in role_ids if str(x).isdigit()}
+    return any(role.id in ids for role in member.roles)
+
+
+def make_mod_embed(title: str, color: int, member: discord.abc.User,
+                   reason: str, channel: discord.abc.GuildChannel | None = None) -> discord.Embed:
+    e = discord.Embed(title=title, color=color, timestamp=dt.datetime.now(dt.timezone.utc))
+    e.set_thumbnail(url=member.display_avatar.url)
+    e.add_field(name="สมาชิก", value=f"{member.mention} (`{member.id}`)", inline=False)
+    if channel:
+        e.add_field(name="ห้อง", value=channel.mention, inline=True)
+    e.add_field(name="รายละเอียด", value=reason[:1000] or "ไม่ระบุ", inline=False)
+    return e
+
+
+async def moderate_message(message: discord.Message) -> bool:
+    """Returns True when the message was handled by the moderation filters."""
+    guild = message.guild
+    if guild is None or message.author.bot or not isinstance(message.author, discord.Member):
+        return False
+    cfg = mod_config(guild.id)
+    member = message.author
+
+    # URL exception roles apply only to the URL filter, not to blocked-image detection.
+    url_exempt = (member.guild_permissions.administrator or
+                  member_has_role_id(member, cfg.get("link_exempt_role_ids", [])))
+    if cfg.get("links_enabled") and not url_exempt and LINK_RE.search(message.content or ""):
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass
+        timed_out = False
+        try:
+            await member.timeout(dt.timedelta(seconds=60), reason="ส่งลิงก์ในห้องที่เปิดระบบห้ามลิงก์")
+            timed_out = True
+        except (discord.Forbidden, discord.HTTPException) as ex:
+            print("link timeout error:", repr(ex))
+        try:
+            warning = await message.channel.send(
+                f"⚠️ {member.mention} ส่งลิงก์ไม่ได้ ข้อความถูกลบแล้ว" +
+                (" และถูกหมดเวลา 60 วินาที" if timed_out else " (บอทไม่มีสิทธิ์ Timeout สมาชิก)"),
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+            await asyncio.sleep(8)
+            await warning.delete()
+        except discord.HTTPException:
+            pass
+        embed = make_mod_embed("🔗 ลบลิงก์และจัดการสมาชิก", 0xE67E22, member,
+                               "ส่งลิงก์ที่ไม่อนุญาต · " + ("Timeout 60 วินาที" if timed_out else "ลบข้อความแล้ว"),
+                               message.channel)
+        await send_mod_log(guild, embed)
+        return True
+
+    if cfg.get("images_enabled"):
+        blocked_hash = str(cfg.get("blocked_image_phash") or BLOCKED_IMAGE_PHASH_DEFAULT)
+        for attachment in message.attachments:
+            if not ((attachment.content_type or "").lower().startswith("image/") or
+                    attachment.filename.lower().endswith(IMAGE_EXTENSIONS)):
+                continue
+            if attachment.size > 8 * 1024 * 1024:
+                continue
+            try:
+                raw = await attachment.read()
+                candidate = await asyncio.to_thread(image_phash, raw)
+            except Exception as ex:
+                print("image moderation scan error:", repr(ex))
+                continue
+            if hamming_hex(candidate, blocked_hash) <= BLOCKED_IMAGE_DISTANCE:
+                try:
+                    await message.delete()
+                except discord.HTTPException:
+                    pass
+                try:
+                    warning = await message.channel.send(
+                        f"🛡️ {member.mention} ลบรูปที่ถูกตั้งเป็นรายการห้ามส่งแล้ว",
+                        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+                    await asyncio.sleep(8)
+                    await warning.delete()
+                except discord.HTTPException:
+                    pass
+                embed = make_mod_embed("🖼️ ลบรูปต้องห้าม", 0xE74C3C, member,
+                                       "รูปตรงกับ fingerprint ที่ผู้ดูแลตั้งค่าไว้", message.channel)
+                await send_mod_log(guild, embed)
+                return True
+    return False
+
+
+@client.event
+async def on_member_ban(guild: discord.Guild, user: discord.User):
+    """Ban events do not contain the actor/reason; inspect recent audit-log entries."""
+    moderator = "ไม่พบข้อมูล (ตรวจสอบสิทธิ์ View Audit Log)"
+    reason = "ไม่ระบุ"
+    await asyncio.sleep(1.0)  # allow the audit-log entry to become visible
+    try:
+        async for entry in guild.audit_logs(limit=8, action=discord.AuditLogAction.ban):
+            target_id = getattr(entry.target, "id", None)
+            age = abs((dt.datetime.now(dt.timezone.utc) - entry.created_at).total_seconds())
+            if target_id == user.id and age <= 120:
+                moderator = f"{entry.user} (`{entry.user.id}`)" if entry.user else "ไม่ทราบ"
+                reason = entry.reason or "ไม่ระบุ"
+                break
+    except (discord.Forbidden, discord.HTTPException) as ex:
+        print("ban audit-log lookup error:", repr(ex))
+    embed = make_mod_embed("🔨 สมาชิกถูกแบน", 0x992D22, user, reason)
+    embed.add_field(name="ผู้ดำเนินการ", value=moderator[:1000], inline=False)
+    await send_mod_log(guild, embed)
+
+
+@tree.command(name="cmsetting", description="ตั้งค่าสิทธิ์ /avatra และระบบ moderation", guild=G)
+@app_commands.describe(action="เลือกการตั้งค่า", role="ยศที่จะเพิ่ม/นำออก", channel="ห้องแจ้งเตือน")
+@app_commands.choices(action=[
+    app_commands.Choice(name="ตั้งห้องแจ้งเตือน", value="log_channel"),
+    app_commands.Choice(name="เพิ่มยศใช้ /avatra", value="avatar_role_add"),
+    app_commands.Choice(name="นำยศใช้ /avatra ออก", value="avatar_role_remove"),
+    app_commands.Choice(name="เพิ่มยศยกเว้นห้ามส่งลิงก์", value="link_role_add"),
+    app_commands.Choice(name="นำยศยกเว้นลิงก์ออก", value="link_role_remove"),
+    app_commands.Choice(name="เปิดระบบห้ามลิงก์", value="links_on"),
+    app_commands.Choice(name="ปิดระบบห้ามลิงก์", value="links_off"),
+    app_commands.Choice(name="เปิดระบบบล็อกรูป", value="images_on"),
+    app_commands.Choice(name="ปิดระบบบล็อกรูป", value="images_off"),
+])
+@app_commands.default_permissions(administrator=True)
+async def cmsetting(interaction: discord.Interaction, action: app_commands.Choice[str],
+                    role: discord.Role | None = None,
+                    channel: discord.TextChannel | None = None):
+    if interaction.guild is None or not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ เฉพาะแอดมินในเซิร์ฟเวอร์เท่านั้น", ephemeral=True)
+    cfg = mod_config(interaction.guild.id)
+    if action.value == "log_channel":
+        if channel is None:
+            return await interaction.response.send_message("กรุณาเลือกห้องในช่อง channel", ephemeral=True)
+        cfg["log_channel_id"] = channel.id
+        reply = f"✅ ตั้งห้องแจ้งเตือนเป็น {channel.mention} แล้ว"
+    elif action.value in ("avatar_role_add", "avatar_role_remove", "link_role_add", "link_role_remove"):
+        if role is None:
+            return await interaction.response.send_message("กรุณาเลือกยศในช่อง role", ephemeral=True)
+        key = "avatar_role_ids" if action.value.startswith("avatar_") else "link_exempt_role_ids"
+        ids = set(int(x) for x in cfg.get(key, []) if str(x).isdigit())
+        if action.value.endswith("_add"):
+            ids.add(role.id)
+            reply = f"✅ เพิ่ม {role.mention} ในรายการแล้ว"
+        else:
+            ids.discard(role.id)
+            reply = f"✅ นำ {role.mention} ออกจากรายการแล้ว"
+        cfg[key] = sorted(ids)
+    elif action.value == "links_on":
+        cfg["links_enabled"] = True
+        reply = "✅ เปิดระบบห้ามลิงก์ (สมาชิกทั่วไปจะถูกลบข้อความและ Timeout 60 วินาที)"
+    elif action.value == "links_off":
+        cfg["links_enabled"] = False
+        reply = "✅ ปิดระบบห้ามลิงก์แล้ว"
+    elif action.value == "images_on":
+        cfg["images_enabled"] = True
+        reply = "✅ เปิดระบบบล็อกรูป fingerprint ที่ตั้งไว้แล้ว"
+    else:
+        cfg["images_enabled"] = False
+        reply = "✅ ปิดระบบบล็อกรูปแล้ว"
+    try:
+        save_mod_configs()
+    except OSError as ex:
+        print("moderation config save error:", repr(ex))
+        return await interaction.response.send_message("❌ บันทึกการตั้งค่าไม่สำเร็จ", ephemeral=True)
+    await interaction.response.send_message(reply, ephemeral=True)
+
+
+@tree.command(name="avatra", description="ส่งรูปโปรไฟล์ของสมาชิกในห้องนี้", guild=G)
+@app_commands.describe(member="เลือกสมาชิกที่ต้องการดูรูปโปรไฟล์")
+async def avatra(interaction: discord.Interaction, member: discord.Member):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ ใช้ได้ในเซิร์ฟเวอร์เท่านั้น", ephemeral=True)
+    cfg = mod_config(interaction.guild.id)
+    if not (interaction.user.guild_permissions.administrator or
+            member_has_role_id(interaction.user, cfg.get("avatar_role_ids", []))):
+        return await interaction.response.send_message("❌ คุณไม่ได้รับอนุญาตให้ใช้คำสั่งนี้", ephemeral=True)
+    embed = discord.Embed(title=f"รูปโปรไฟล์ของ {member.display_name}", color=0x5865F2)
+    embed.set_image(url=member.display_avatar.url)
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="announce", description="ส่งประกาศไปยังห้องที่เลือก (ไม่ส่ง DM จำนวนมาก)", guild=G)
+@app_commands.describe(channel="ห้องประกาศ", message="ข้อความประกาศ", as_embed="แสดงเป็น Embed หรือไม่")
+@app_commands.default_permissions(administrator=True)
+async def announce(interaction: discord.Interaction, channel: discord.TextChannel,
+                   message: str, as_embed: bool = False):
+    if interaction.guild is None or not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ เฉพาะแอดมินในเซิร์ฟเวอร์เท่านั้น", ephemeral=True)
+    text = message.strip()[:2000]
+    if not text:
+        return await interaction.response.send_message("❌ กรุณาใส่ข้อความประกาศ", ephemeral=True)
+    try:
+        if as_embed:
+            await channel.send(embed=discord.Embed(title="📢 ประกาศ", description=text, color=0x5865F2),
+                               allowed_mentions=discord.AllowedMentions.none())
+        else:
+            await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+    except discord.HTTPException as ex:
+        print("announcement send error:", repr(ex))
+        return await interaction.response.send_message("❌ ส่งประกาศไม่สำเร็จ ตรวจสอบสิทธิ์บอท", ephemeral=True)
+    await interaction.response.send_message(f"✅ ส่งประกาศใน {channel.mention} แล้ว", ephemeral=True)
+
+
+# -------- OAuth2: เข้าร่วมเซิร์ฟเวอร์ด้วยความยินยอมของเจ้าของบัญชี --------
+OAUTH_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "").strip()
+OAUTH_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
+OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI", "").strip()
+OAUTH_PUBLIC_URL = os.getenv("OAUTH_PUBLIC_URL", "").strip()
+OAUTH_GUILD_ID = int(os.getenv("OAUTH_GUILD_ID", str(GUILD_ID)))
+OAUTH_PORT = int(os.getenv("PORT", os.getenv("OAUTH_PORT", "8080")))
+oauth_runner: web.AppRunner | None = None
+
+
+async def oauth_home(request: web.Request):
+    body = ("<!doctype html><meta charset='utf-8'><title>เชื่อมต่อ Discord</title>"
+            "<h2>เข้าร่วมเซิร์ฟเวอร์ Discord</h2>"
+            "<p>เมื่อกดปุ่มด้านล่าง คุณจะอนุญาตให้แอปอ่าน Discord ID ของคุณและเพิ่มบัญชีของคุณ "
+            "เข้าสู่เซิร์ฟเวอร์ที่กำหนดเท่านั้น ระบบไม่ขอรหัสผ่านและไม่เก็บ access token หลังดำเนินการ</p>"
+            "<p><a href='/oauth/start'>ดำเนินการและอนุญาตผ่าน Discord</a></p>")
+    return web.Response(text=body, content_type="text/html")
+
+
+async def oauth_start(request: web.Request):
+    if not (OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET and OAUTH_REDIRECT_URI and TOKEN):
+        return web.Response(text="OAuth ยังตั้งค่าไม่ครบ", status=503)
+    state = secrets.token_urlsafe(32)
+    query = urlencode({
+        "client_id": OAUTH_CLIENT_ID,
+        "redirect_uri": OAUTH_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "identify guilds.join",
+        "state": state,
+    })
+    response = web.HTTPFound("https://discord.com/oauth2/authorize?" + query)
+    response.set_cookie("discord_oauth_state", state, max_age=300, httponly=True,
+                        secure=OAUTH_REDIRECT_URI.startswith("https://"), samesite="Lax")
+    raise response
+
+
+async def oauth_callback(request: web.Request):
+    state = request.query.get("state", "")
+    cookie_state = request.cookies.get("discord_oauth_state", "")
+    if not state or not cookie_state or not secrets.compare_digest(state, cookie_state):
+        return web.Response(text="คำขอไม่ถูกต้อง กรุณากลับไปเริ่มใหม่", status=400)
+    if request.query.get("error"):
+        return web.Response(text="คุณยกเลิกการอนุญาต จึงยังไม่ได้เข้าร่วมเซิร์ฟเวอร์", status=400)
+    code = request.query.get("code", "")
+    if not code or session is None or not TOKEN:
+        return web.Response(text="ระบบ OAuth ยังไม่พร้อมใช้งาน", status=503)
+    try:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with session.post("https://discord.com/api/oauth2/token", data={
+            "client_id": OAUTH_CLIENT_ID,
+            "client_secret": OAUTH_CLIENT_SECRET,
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": OAUTH_REDIRECT_URI,
+        }, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=timeout) as resp:
+            token_data = await resp.json(content_type=None)
+            if resp.status != 200 or not token_data.get("access_token"):
+                return web.Response(text="Discord ไม่อนุมัติ OAuth กรุณาลองใหม่", status=400)
+        user_token = token_data["access_token"]
+        async with session.get("https://discord.com/api/users/@me",
+                               headers={"Authorization": f"Bearer {user_token}"}, timeout=timeout) as resp:
+            user_data = await resp.json(content_type=None)
+            if resp.status != 200 or not user_data.get("id"):
+                return web.Response(text="อ่านบัญชี Discord ไม่สำเร็จ", status=400)
+        # Use the bot token only for the documented guild-member add endpoint;
+        # the user's short-lived OAuth token is not written to disk or logs.
+        async with session.put(
+            f"https://discord.com/api/guilds/{OAUTH_GUILD_ID}/members/{user_data['id']}",
+            headers={"Authorization": f"Bot {TOKEN}"}, json={"access_token": user_token}, timeout=timeout
+        ) as resp:
+            if resp.status in (201, 204):
+                result = "สำเร็จ บัญชี Discord ของคุณเข้าร่วมเซิร์ฟเวอร์แล้ว"
+            elif resp.status == 403:
+                result = "บอทไม่มีสิทธิ์เพิ่มสมาชิก ตรวจสอบว่าเปิด scope guilds.join และบอทอยู่ในเซิร์ฟเวอร์"
+            else:
+                print("OAuth guild join failed:", resp.status, (await resp.text())[:300])
+                result = "เพิ่มเข้าร่วมเซิร์ฟเวอร์ไม่สำเร็จ กรุณาติดต่อผู้ดูแล"
+        response = web.Response(text=result, content_type="text/plain")
+        response.del_cookie("discord_oauth_state")
+        return response
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as ex:
+        print("OAuth callback error:", repr(ex))
+        return web.Response(text="เชื่อมต่อ Discord ไม่สำเร็จ กรุณาลองใหม่", status=502)
+
+
+async def start_oauth_web():
+    global oauth_runner
+    if oauth_runner is not None:
+        return
+    if not (OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET and OAUTH_REDIRECT_URI):
+        print("[oauth] disabled: configure DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, OAUTH_REDIRECT_URI")
+        return
+    app = web.Application(client_max_size=32 * 1024)
+    app.router.add_get("/", oauth_home)
+    app.router.add_get("/oauth/start", oauth_start)
+    app.router.add_get("/oauth/callback", oauth_callback)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", OAUTH_PORT)
+    await site.start()
+    oauth_runner = runner
+    print(f"[oauth] listening on 0.0.0.0:{OAUTH_PORT}; guild={OAUTH_GUILD_ID}")
+
+
+@tree.command(name="connect", description="ลิงก์ยินยอม OAuth เพื่อเข้าร่วมเซิร์ฟเวอร์", guild=G)
+async def connect_cmd(interaction: discord.Interaction):
+    if not (OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET and OAUTH_REDIRECT_URI and OAUTH_PUBLIC_URL):
+        return await interaction.response.send_message(
+            "❌ ระบบ OAuth ยังตั้งค่าไม่ครบ ให้ผู้ดูแลตั้งค่า DISCORD_CLIENT_ID / SECRET / REDIRECT_URI / PUBLIC_URL ก่อน",
+            ephemeral=True)
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="อ่านรายละเอียดและเชื่อมต่อ Discord", style=discord.ButtonStyle.link,
+                                    url=OAUTH_PUBLIC_URL.rstrip("/")))
+    await interaction.response.send_message(
+        "กดลิงก์เพื่ออ่านสิทธิ์ที่ขอและยืนยันกับ Discord ด้วยตนเอง ระบบจะเพิ่มเข้าร่วมเซิร์ฟเวอร์หลังคุณอนุญาตเท่านั้น",
+        view=view, ephemeral=True)
+
+
+# ----------------------------- ระบบเพลง -----------------------------
+try:
+    import yt_dlp
+except ImportError:
+    yt_dlp = None
+
+MUSIC_QUEUES: dict[int, asyncio.Queue] = {}
+MUSIC_TASKS: dict[int, asyncio.Task] = {}
+MUSIC_REPEAT: set[int] = set()
+MAX_PLAYLIST_TRACKS = 50
+
+
+def extract_music_tracks(query: str) -> list[dict]:
+    if yt_dlp is None:
+        raise RuntimeError("ยังไม่ได้ติดตั้ง yt-dlp")
+    parsed = urlparse(query)
+    if parsed.scheme and parsed.scheme not in ("http", "https"):
+        raise ValueError("รองรับเฉพาะ URL http/https หรือคำค้นหา")
+    if parsed.scheme in ("http", "https"):
+        host = (parsed.hostname or "").lower()
+        if not (host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")):
+            raise ValueError("รองรับ URL YouTube/playlist เท่านั้น หรือใส่ชื่อเพลงเพื่อค้นหา")
+    target = query if parsed.scheme in ("http", "https") else f"ytsearch1:{query}"
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True,
+            "extract_flat": "in_playlist", "noplaylist": False}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        result = ydl.extract_info(target, download=False)
+    entries = result.get("entries") if isinstance(result, dict) and result.get("entries") else [result]
+    tracks = []
+    for item in entries:
+        if not item:
+            continue
+        url = item.get("webpage_url") or item.get("original_url")
+        if not url:
+            raw_url = item.get("url", "")
+            if raw_url.startswith(("http://", "https://")):
+                url = raw_url
+            elif item.get("id"):
+                url = f"https://www.youtube.com/watch?v={item['id']}"
+        if url and url.startswith(("http://", "https://")):
+            tracks.append({"title": str(item.get("title") or "ไม่ทราบชื่อ")[:180], "url": url})
+        if len(tracks) >= MAX_PLAYLIST_TRACKS:
+            break
+    return tracks
+
+
+def resolve_audio_stream(url: str) -> tuple[str, str]:
+    if yt_dlp is None:
+        raise RuntimeError("ยังไม่ได้ติดตั้ง yt-dlp")
+    opts = {"quiet": True, "no_warnings": True, "format": "bestaudio/best", "noplaylist": True}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    return info["url"], str(info.get("title") or "เพลง")[:180]
+
+
+def can_control_music(interaction: discord.Interaction) -> bool:
+    guild = interaction.guild
+    member = interaction.user
+    if guild is None or not isinstance(member, discord.Member):
+        return False
+    if member.guild_permissions.administrator:
+        return True
+    voice = guild.voice_client
+    return bool(voice and member.voice and member.voice.channel == voice.channel)
+
+
+async def music_player(guild: discord.Guild, text_channel: discord.abc.Messageable):
+    gid = guild.id
+    queue = MUSIC_QUEUES.setdefault(gid, asyncio.Queue())
+    try:
+        while True:
+            voice = guild.voice_client
+            if voice is None or not voice.is_connected():
+                return
+            track = await queue.get()
+            while True:
+                try:
+                    stream_url, title = await asyncio.to_thread(resolve_audio_stream, track["url"])
+                    source = discord.FFmpegPCMAudio(
+                        stream_url,
+                        before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+                        options="-vn")
+                    done = asyncio.Event()
+                    loop = asyncio.get_running_loop()
+                    voice.play(source, after=lambda error: loop.call_soon_threadsafe(done.set))
+                    await text_channel.send(f"🎶 กำลังเล่น: **{title}**")
+                    await done.wait()
+                    if gid in MUSIC_REPEAT and voice.is_connected():
+                        continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception as ex:
+                    print("music playback error:", repr(ex))
+                    try:
+                        await text_channel.send("❌ เปิดเพลงนี้ไม่สำเร็จ ข้ามไปเพลงถัดไป")
+                    except discord.HTTPException:
+                        pass
+                break
+    except asyncio.CancelledError:
+        pass
+    finally:
+        MUSIC_TASKS.pop(gid, None)
+
+
+@tree.command(name="play", description="เปิดเพลงจากคำค้นหา, URL หรือ playlist", guild=G)
+@app_commands.describe(query="ชื่อเพลงหรือ URL ของเพลง/playlist")
+async def play_cmd(interaction: discord.Interaction, query: str):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        return await interaction.response.send_message("❌ ใช้ได้ในเซิร์ฟเวอร์เท่านั้น", ephemeral=True)
+    if yt_dlp is None:
+        return await interaction.response.send_message("❌ ติดตั้ง yt-dlp ก่อน: `pip install yt-dlp`", ephemeral=True)
+    voice_state = interaction.user.voice
+    if voice_state is None or voice_state.channel is None:
+        return await interaction.response.send_message("❌ เข้าห้องเสียงก่อนใช้คำสั่งนี้", ephemeral=True)
+    await interaction.response.defer(thinking=True)
+    try:
+        tracks = await asyncio.to_thread(extract_music_tracks, query.strip())
+        if not tracks:
+            return await interaction.followup.send("❌ ไม่พบเพลงจากคำค้นหานี้")
+        queue = MUSIC_QUEUES.setdefault(interaction.guild.id, asyncio.Queue())
+        if queue.qsize() + len(tracks) > 100:
+            return await interaction.followup.send("❌ คิวเพลงเกิน 100 เพลง กรุณารอให้เพลงเล่นก่อน")
+        voice = interaction.guild.voice_client
+        if voice is None:
+            voice = await voice_state.channel.connect()
+        elif not voice.is_connected():
+            await voice_state.channel.connect()
+        elif voice.channel != voice_state.channel:
+            return await interaction.followup.send("❌ บอทอยู่คนละห้องเสียงกับคุณ")
+        for track in tracks:
+            await queue.put(track)
+        if interaction.guild.id not in MUSIC_TASKS or MUSIC_TASKS[interaction.guild.id].done():
+            MUSIC_TASKS[interaction.guild.id] = asyncio.create_task(music_player(interaction.guild, interaction.channel))
+        summary = f"✅ เพิ่ม **{len(tracks)}** เพลงเข้าคิวแล้ว"
+        if len(tracks) == MAX_PLAYLIST_TRACKS:
+            summary += f" (จำกัด playlist สูงสุด {MAX_PLAYLIST_TRACKS} เพลงต่อครั้ง)"
+        await interaction.followup.send(summary)
+    except (ValueError, RuntimeError) as ex:
+        await interaction.followup.send(f"❌ {ex}")
+    except Exception as ex:
+        print("play command error:", repr(ex))
+        await interaction.followup.send("❌ เปิดเพลงไม่สำเร็จ ตรวจสอบ yt-dlp, FFmpeg และสิทธิ์ห้องเสียง")
+
+
+@tree.command(name="loop", description="เปิด/ปิดวนเพลงปัจจุบัน", guild=G)
+@app_commands.describe(enabled="เปิดหรือปิดการวนเพลง")
+async def loop_cmd(interaction: discord.Interaction, enabled: bool):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ ใช้ได้ในเซิร์ฟเวอร์เท่านั้น", ephemeral=True)
+    if not can_control_music(interaction):
+        return await interaction.response.send_message("❌ ต้องอยู่ห้องเสียงเดียวกับบอทเพื่อควบคุมเพลง", ephemeral=True)
+    gid = interaction.guild.id
+    if enabled:
+        MUSIC_REPEAT.add(gid)
+        reply = "🔁 เปิดวนเพลงปัจจุบันแล้ว"
+    else:
+        MUSIC_REPEAT.discard(gid)
+        reply = "➡️ ปิดวนเพลงแล้ว"
+    await interaction.response.send_message(reply, ephemeral=True)
+
+
+@tree.command(name="skip", description="ข้ามเพลงปัจจุบัน", guild=G)
+async def skip_cmd(interaction: discord.Interaction):
+    if interaction.guild is None or not can_control_music(interaction):
+        return await interaction.response.send_message("❌ ต้องอยู่ห้องเสียงเดียวกับบอทเพื่อข้ามเพลง", ephemeral=True)
+    voice = interaction.guild.voice_client if interaction.guild else None
+    if voice is None or not voice.is_playing():
+        return await interaction.response.send_message("ไม่มีเพลงที่กำลังเล่น", ephemeral=True)
+    voice.stop()
+    await interaction.response.send_message("⏭️ ข้ามเพลงแล้ว")
+
+
+@tree.command(name="stop", description="หยุดเพลง ล้างคิว และออกจากห้องเสียง", guild=G)
+async def stop_cmd(interaction: discord.Interaction):
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ ใช้ได้ในเซิร์ฟเวอร์เท่านั้น", ephemeral=True)
+    if not can_control_music(interaction):
+        return await interaction.response.send_message("❌ ต้องอยู่ห้องเสียงเดียวกับบอทเพื่อหยุดเพลง", ephemeral=True)
+    gid = interaction.guild.id
+    queue = MUSIC_QUEUES.setdefault(gid, asyncio.Queue())
+    while not queue.empty():
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+    MUSIC_REPEAT.discard(gid)
+    task = MUSIC_TASKS.get(gid)
+    if task and not task.done():
+        task.cancel()
+    voice = interaction.guild.voice_client
+    if voice is not None:
+        if voice.is_playing() or voice.is_paused():
+            voice.stop()
+        await voice.disconnect(force=True)
+    await interaction.response.send_message("⏹️ หยุดเพลง ล้างคิว และออกจากห้องเสียงแล้ว")
+
+
+# -------- OAuth startup is added to the existing on_ready event below --------
+# ===========================================================================
+
+
 # ---------- ตรวจสลิปอัตโนมัติ (Slip2Go) ----------
 def receiver_conditions() -> list[dict]:
     """บัญชีที่ยอมรับ: พร้อมเพย์เบอร์โทร หรือ TrueMoney Wallet เบอร์เดียวกัน (ตรงอย่างใดอย่างหนึ่งถือว่าผ่าน)"""
@@ -1388,7 +2018,9 @@ def slip_embed(message: discord.Message, kind: str, js: dict | None, note: str |
 @client.event
 async def on_message(message: discord.Message):
     """รับรูปจากเจ้าของ order ticket → ตรวจสลิปอัตโนมัติ → ส่งผลให้ทีมงานกดยืนยัน"""
-    if message.author.bot or not isinstance(message.channel, discord.TextChannel):
+    if message.author.bot or not isinstance(message.channel, (discord.TextChannel, discord.Thread)):
+        return
+    if await moderate_message(message):
         return
     info = parse_topic(message.channel)
     if not info or info.get("kind") != "order" or message.author.id != info["opener"]:
@@ -1488,6 +2120,12 @@ async def on_ready():
         _ticket_ready = True
     if session is None:
         session = aiohttp.ClientSession()
+    try:
+        await start_oauth_web()
+    except Exception as ex:
+        # A web-port/configuration problem must not prevent the Discord bot
+        # from starting and registering its ordinary commands.
+        print("[oauth] web server startup failed:", repr(ex))
     await tree.sync(guild=discord.Object(id=GUILD_ID))
     if not watcher.is_running():
         watcher.start()
