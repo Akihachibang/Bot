@@ -2,7 +2,7 @@
 Discord Key Bot (v2 - ตรวจชื่อคอลัมน์อัตโนมัติ)
 แจ้งเตือน: สร้างคีย์ / รีเซ็ต HWID / ผูก HWID / ยกเลิกคีย์ / ลบคีย์ / แก้ไขคีย์
 คำสั่ง: /chekstock , /downdownload
-​
+
 ติดตั้ง:  pip install discord.py aiohttp python-dotenv
 .env:
     DISCORD_TOKEN=...
@@ -21,24 +21,24 @@ import io
 import datetime as dt
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
-​
+
 import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
-​
+
 load_dotenv()
-​
+
 # ================= ตั้งค่า =================
 TOKEN = os.getenv("DISCORD_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://cgsuxxyezqhxayllhzfs.supabase.co")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-​
+
 GUILD_ID = 1572061109714948166
 LOG_CHANNEL_ID = 1572143297219137650
 DOWNLOAD_URL = "https://drive.google.com/file/d/11POxfP50cmKD1RaXWdeFOOcaDD6csVwx/view"
-​
+
 KEYS_TABLE = "license_keys"
 EVENTS_TABLE = "license_events"
 WATCH_EVENTS = False   # True = แจ้งเตือนทุกแถวใหม่ในตาราง license_events ด้วย
@@ -46,7 +46,7 @@ POLL_SECONDS = 10
 SHOP_TIMEZONE = ZoneInfo("Asia/Bangkok")
 SHOP_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shop_hours.json")
 SHOP_CONFIGS: dict[str, dict] = {}
-​
+
 # รูป QR ชำระเงิน (แสดงใน ticket สั่งซื้อ)
 # ถ้ามีไฟล์ qr.png วางข้าง key_bot.py บอทจะใช้ไฟล์นี้ก่อน (ไม่มีวันหมดอายุ แนะนำวิธีนี้)
 # ถ้าไม่มี จะใช้ลิงก์ด้านล่าง (ลิงก์ Discord CDN มีวันหมดอายุ)
@@ -56,7 +56,7 @@ MAX_SLIP_BYTES = 8 * 1024 * 1024
 MAX_SLIP_TOTAL_BYTES = 16 * 1024 * 1024
 MAX_SLIP_FILES = 4
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
-​
+
 # ---------- ตรวจสลิปอัตโนมัติด้วย Slip2Go ----------
 SLIP2GO_API_URL = os.getenv("SLIP2GO_API_URL", "https://connect.slip2go.com").rstrip("/")
 SLIP2GO_SECRET = os.getenv("SLIP2GO_SECRET", "").strip()
@@ -87,15 +87,15 @@ QR_IMAGE_URL = os.getenv(
     "Instagram_Post_1.png?ex=6afdb973&is=6afc67f3&"
     "hm=87d582dee30e43dac526fbfbf080cad9d47a7791c25668f65f98319720f7fc56&",
 )
-​
+
 # ถ้าตรวจอัตโนมัติผิด ให้ใส่ชื่อคอลัมน์เองตรงนี้ (เว้นว่าง = ตรวจเอง)
 FORCE_ID_COL = ""
 FORCE_KEY_COL = ""
 FORCE_HWID_COL = ""
 # ===========================================
-​
+
 HEADERS = {"apikey": SUPABASE_KEY or "", "Authorization": f"Bearer {SUPABASE_KEY}"}
-​
+
 BOOL_REVOKED = {"revoked", "is_revoked", "banned", "is_banned", "disabled",
                 "is_disabled", "cancelled", "canceled", "blacklisted", "is_blacklisted"}
 BOOL_SOLD = {"is_sold", "sold", "is_used", "used", "redeemed", "is_redeemed",
@@ -108,13 +108,13 @@ REVOKED_VALUES = {"revoked", "banned", "cancelled", "canceled", "disabled",
 SOLD_VALUES = {"sold", "used", "redeemed", "activated", "active", "claimed", "assigned"}
 IGNORE_CHANGE = {"updated_at", "ip", "last_ip", "last_seen", "last_used",
                  "last_check", "last_login"}
-​
+
 intents = discord.Intents.default()
 # เปิดเป็น 1 เมื่อเปิด "Message Content Intent" ใน Developer Portal แล้ว (ใช้เก็บข้อความใน transcript)
 intents.message_content = os.getenv("ENABLE_MESSAGE_CONTENT") == "1"
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
-​
+
 session: aiohttp.ClientSession | None = None
 snapshot: dict = {}
 first_run = True
@@ -124,8 +124,8 @@ review_counts: dict[int, int] = {}
 TOPIC_SYNC_COOLDOWN_SECONDS = 360  # Discord กลับมาอนุญาต PATCH หลัง retry_after พร้อม buffer
 review_topic_pending_at: dict[int, float] = {}
 review_topic_tasks: dict[int, asyncio.Task] = {}
-​
-​
+
+
 # ---------- ตัวช่วย ----------
 def pick(cols, cands):
     low = {c.lower(): c for c in cols}
@@ -133,8 +133,8 @@ def pick(cols, cands):
         if c in low:
             return low[c]
     return None
-​
-​
+
+
 def detect_schema(rows: list[dict]):
     """ตรวจชื่อคอลัมน์จากแถวตัวอย่าง"""
     global schema
@@ -152,14 +152,14 @@ def detect_schema(rows: list[dict]):
         schema = new
         print(f"[schema] คอลัมน์ทั้งหมด: {cols}")
         print(f"[schema] id={id_col} | key={key_col} | hwid={hwid_col}")
-​
-​
+
+
 def truthy(v) -> bool:
     if isinstance(v, str):
         return v.strip().lower() in ("true", "1", "yes", "y", "t")
     return bool(v)
-​
-​
+
+
 def is_revoked(row: dict) -> bool:
     for c, v in row.items():
         lc = c.lower()
@@ -168,8 +168,8 @@ def is_revoked(row: dict) -> bool:
         if lc in STATUS_COLS and str(v or "").lower() in REVOKED_VALUES:
             return True
     return False
-​
-​
+
+
 def is_sold(row: dict) -> bool:
     found_info = False
     for c, v in row.items():
@@ -189,18 +189,18 @@ def is_sold(row: dict) -> bool:
     if not found_info and schema.get("hwid"):      # ไม่มีคอลัมน์บอกสถานะเลย
         return bool(row.get(schema["hwid"]))       # ถือว่าผูก HWID แล้ว = ใช้แล้ว
     return False
-​
-​
+
+
 def mask(v) -> str:
     s = str(v if v not in (None, "") else "-")
     return s if len(s) <= 8 else f"{s[:4]}…{s[-4:]}"
-​
-​
+
+
 def key_of(row: dict) -> str:
     c = schema.get("key") or schema.get("id")
     return mask(row.get(c))
-​
-​
+
+
 async def fetch_all(table: str) -> list[dict]:
     out, start = [], 0
     while True:
@@ -213,8 +213,8 @@ async def fetch_all(table: str) -> list[dict]:
         if len(page) < 1000:
             return out
         start += 1000
-​
-​
+
+
 def make_embed(title: str, color: int, row: dict, extra: str = "") -> discord.Embed:
     e = discord.Embed(title=title, color=color, timestamp=dt.datetime.now(dt.timezone.utc))
     e.add_field(name="Key", value=f"`{key_of(row)}`", inline=True)
@@ -223,8 +223,8 @@ def make_embed(title: str, color: int, row: dict, extra: str = "") -> discord.Em
     if extra:
         e.add_field(name="รายละเอียด", value=extra[:1000], inline=False)
     return e
-​
-​
+
+
 def deleted_embed(row: dict) -> discord.Embed:
     """แจ้งลบคีย์ พร้อมข้อมูลครบทุกคอลัมน์ของแถวที่ถูกลบ"""
     if is_revoked(row):
@@ -233,7 +233,7 @@ def deleted_embed(row: dict) -> discord.Embed:
         state = "💰 ขายแล้ว/ถูกใช้งานแล้ว"
     else:
         state = "📦 ยังอยู่ใน Stock (ยังไม่ขาย)"
-​
+
     e = discord.Embed(title="🗑️ ลบคีย์ออกจากระบบ", color=0x95A5A6,
                       timestamp=dt.datetime.now(dt.timezone.utc))
     kc = schema.get("key") or schema.get("id")
@@ -243,7 +243,7 @@ def deleted_embed(row: dict) -> discord.Embed:
     if hw:
         e.add_field(name="HWID ที่ผูกอยู่",
                     value=f"`{row.get(hw)}`" if row.get(hw) else "ยังไม่ผูก", inline=True)
-​
+
     lines = []
     for c, v in row.items():
         if v in (None, ""):
@@ -254,13 +254,13 @@ def deleted_embed(row: dict) -> discord.Embed:
     e.set_footer(text="ระบบตรวจพบว่าแถวนี้หายไปจากตาราง "
                       "(ไม่ทราบผู้ลบ) เวลาตรวจพบตามข้างบน")
     return e
-​
-​
+
+
 async def notify(e: discord.Embed):
     ch = client.get_channel(LOG_CHANNEL_ID) or await client.fetch_channel(LOG_CHANNEL_ID)
     await ch.send(embed=e)
-​
-​
+
+
 # ---------- ตัวเฝ้าดูตารางคีย์ ----------
 @tasks.loop(seconds=POLL_SECONDS)
 async def watcher():
@@ -272,11 +272,11 @@ async def watcher():
         if not idc:
             return
         current = {r.get(idc): r for r in rows}
-​
+
         if first_run:
             snapshot, first_run = current, False
             return
-​
+
         hw = schema.get("hwid")
         for rid, new in current.items():
             old = snapshot.get(rid)
@@ -285,13 +285,13 @@ async def watcher():
                 continue
             if old == new:
                 continue
-​
+
             handled = False
             if not is_revoked(old) and is_revoked(new):
                 await notify(make_embed("⛔ ยกเลิกคีย์", 0xE74C3C, new)); handled = True
             elif is_revoked(old) and not is_revoked(new):
                 await notify(make_embed("♻️ ยกเลิกการแบนคีย์", 0x3498DB, new)); handled = True
-​
+
             if hw and old.get(hw) != new.get(hw):
                 if old.get(hw) and not new.get(hw):
                     await notify(make_embed("🔄 รีเซ็ต HWID", 0xF1C40F, new)); handled = True
@@ -299,7 +299,7 @@ async def watcher():
                     await notify(make_embed("🔗 ผูก HWID ใหม่", 0x9B59B6, new,
                                             f"`{mask(old.get(hw))}` → `{mask(new.get(hw))}`"))
                     handled = True
-​
+
             if not handled:
                 changed = [c for c in new
                            if old.get(c) != new.get(c)
@@ -308,26 +308,26 @@ async def watcher():
                 if changed:
                     await notify(make_embed("🛠️ จัดการคีย์", 0xE67E22, new,
                                             "แก้ไขคอลัมน์: " + ", ".join(changed)))
-​
+
         for rid, old in snapshot.items():
             if rid not in current:
                 await notify(deleted_embed(old))
-​
+
         snapshot = current
     except Exception as ex:
         print("watcher error:", repr(ex))
-​
-​
+
+
 # ---------- ตัวเฝ้าดูตาราง events (เปิดด้วย WATCH_EVENTS) ----------
 @tasks.loop(seconds=POLL_SECONDS)
 async def events_watcher():
     global events_seen
     try:
         rows = await fetch_all(EVENTS_TABLE)
-​
+
         def ident(r):
             return r["id"] if "id" in r else json.dumps(r, sort_keys=True, default=str)
-​
+
         ids = {ident(r) for r in rows}
         if events_seen is None:
             events_seen = ids
@@ -348,8 +348,8 @@ async def events_watcher():
         events_seen = ids
     except Exception as ex:
         print("events error:", repr(ex))
-​
-​
+
+
 # ---------- สถานะเวลาเปิด-ปิดร้าน ----------
 def load_shop_configs():
     """โหลดเวลาเปิด-ปิดและห้องแจ้งเตือนจากไฟล์ เพื่อให้คงอยู่หลังรีสตาร์ต"""
@@ -363,18 +363,18 @@ def load_shop_configs():
     except (OSError, json.JSONDecodeError) as ex:
         print("shop config load error:", repr(ex))
         SHOP_CONFIGS = {}
-​
-​
+
+
 def save_shop_configs():
     temp_path = SHOP_CONFIG_PATH + ".tmp"
     with open(temp_path, "w", encoding="utf-8") as f:
         json.dump(SHOP_CONFIGS, f, ensure_ascii=False, indent=2)
     os.replace(temp_path, SHOP_CONFIG_PATH)
-​
-​
+
+
 load_shop_configs()
-​
-​
+
+
 def shop_is_open(config: dict, now: dt.datetime | None = None) -> bool:
     now = (now or dt.datetime.now(SHOP_TIMEZONE)).astimezone(SHOP_TIMEZONE)
     open_at = dt.datetime.strptime(config["open_time"], "%H:%M").time()
@@ -384,19 +384,19 @@ def shop_is_open(config: dict, now: dt.datetime | None = None) -> bool:
         return open_at <= current < close_at
     # รองรับเวลาทำการข้ามเที่ยงคืน เช่น 20:00 ถึง 02:00
     return current >= open_at or current < close_at
-​
-​
+
+
 def shop_status_message(config: dict, is_open: bool) -> str:
     if is_open:
         return (f"🟢 **ร้านเปิดให้บริการแล้ว**\n"
                 f"เวลาเปิด `{config['open_time']}` น. · ปิด `{config['close_time']}` น.")
     return (f"🔴 **ร้านปิดให้บริการแล้ว**\n"
             f"เวลาเปิด `{config['open_time']}` น. · ปิด `{config['close_time']}` น.")
-​
-​
+
+
 LAST_SHOP_PRESENCE_STATUS: str | None = None
-​
-​
+
+
 async def update_shop_presence(config: dict, force: bool = False):
     """ตั้ง activity ของบอทตามเวลาเปิด-ปิด โดยใช้เวลาประเทศไทย"""
     global LAST_SHOP_PRESENCE_STATUS
@@ -404,15 +404,15 @@ async def update_shop_presence(config: dict, force: bool = False):
     status = "open" if is_open else "closed"
     if not force and LAST_SHOP_PRESENCE_STATUS == status:
         return
-​
+
     label = "เปิดให้บริการ🟢" if is_open else "ปิดให้บริการ🔴"
     await client.change_presence(
         status=discord.Status.online,
         activity=discord.Game(name=label),
     )
     LAST_SHOP_PRESENCE_STATUS = status
-​
-​
+
+
 @tasks.loop(seconds=30)
 async def shop_status_watcher():
     """ตรวจสถานะทุก 30 วินาที อัปเดต activity และแจ้งเมื่อร้านเปลี่ยนสถานะ"""
@@ -422,7 +422,7 @@ async def shop_status_watcher():
             await update_shop_presence(presence_config)
         except Exception as ex:
             print("shop presence update error:", repr(ex))
-​
+
     changed = False
     for guild_id, config in list(SHOP_CONFIGS.items()):
         try:
@@ -431,7 +431,7 @@ async def shop_status_watcher():
             status = "open" if is_open else "closed"
             if config.get("last_status") == status:
                 continue
-​
+
             channel = client.get_channel(channel_id)
             if channel is None:
                 channel = await client.fetch_channel(channel_id)
@@ -446,8 +446,8 @@ async def shop_status_watcher():
             print(f"shop status error (guild={guild_id}):", repr(ex))
     if changed:
         save_shop_configs()
-​
-​
+
+
 @tree.command(name="settime", description="ตั้งเวลาเปิด-ปิดร้านและห้องแจ้งเตือน",
               guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(
@@ -466,7 +466,7 @@ async def settime(interaction: discord.Interaction, open_time: str, close_time: 
             "❌ เวลาปิดไม่ถูกต้อง กรุณาใช้รูปแบบ `HH:MM` เช่น `18:30`", ephemeral=True)
     if interaction.guild is None:
         return await interaction.response.send_message("❌ ใช้คำสั่งนี้ในเซิร์ฟเวอร์เท่านั้น", ephemeral=True)
-​
+
     open_time, close_time = open_time.strip(), close_time.strip()
     if open_time == close_time:
         return await interaction.response.send_message(
@@ -475,7 +475,7 @@ async def settime(interaction: discord.Interaction, open_time: str, close_time: 
     if bot_member is None or not channel.permissions_for(bot_member).send_messages:
         return await interaction.response.send_message(
             f"❌ บอทไม่มีสิทธิ์ส่งข้อความใน {channel.mention}", ephemeral=True)
-​
+
     config = {
         "open_time": open_time,
         "close_time": close_time,
@@ -497,12 +497,12 @@ async def settime(interaction: discord.Interaction, open_time: str, close_time: 
         print("settime error:", repr(ex))
         return await interaction.followup.send(
             "❌ บันทึกการตั้งค่าหรือส่งประกาศไม่สำเร็จ ตรวจสอบสิทธิ์บอทและลองอีกครั้ง", ephemeral=True)
-​
+
     await interaction.followup.send(
         f"✅ ตั้งเวลาแล้ว (เวลาไทย): เปิด `{open_time}` · ปิด `{close_time}`\n"
         f"จะแจ้งสถานะใน {channel.mention} เมื่อร้านเปิดหรือปิด", ephemeral=True)
-​
-​
+
+
 # ---------- คำสั่ง ----------
 @tree.command(name="chekstock", description="ดูจำนวนคีย์ที่ยังไม่ถูกขาย",
               guild=discord.Object(id=GUILD_ID))
@@ -516,20 +516,20 @@ async def chekstock(interaction: discord.Interaction):
     except Exception as ex:
         print("stock error:", repr(ex))
         await interaction.followup.send("❌ ดึงข้อมูลสต็อกไม่สำเร็จ")
-​
-​
+
+
 @tree.command(name="downdownload", description="รับลิงก์ดาวน์โหลด",
               guild=discord.Object(id=GUILD_ID))
 async def downdownload(interaction: discord.Interaction):
     await interaction.response.send_message(f"⬇️ ดาวน์โหลดได้ที่นี่\n{DOWNLOAD_URL}", ephemeral=True)
-​
-​
+
+
 # =====================================================================
 #                            ระบบ TICKET
 # =====================================================================
 TZ_TH = dt.timezone(dt.timedelta(hours=7))
 G = discord.Object(id=GUILD_ID)
-​
+
 KINDS = {
     "order": {
         "label": "สั่งซื้อสินค้า", "emoji": "🛒", "style": discord.ButtonStyle.success,
@@ -550,8 +550,8 @@ KINDS = {
         ],
     },
 }
-​
-​
+
+
 def parse_topic(ch) -> dict | None:
     """ข้อมูล ticket เก็บไว้ที่ topic ของห้อง (ไม่ต้องใช้ฐานข้อมูล บอทรีสตาร์ทก็ไม่หาย)"""
     t = getattr(ch, "topic", None) or ""
@@ -563,22 +563,22 @@ def parse_topic(ch) -> dict | None:
                 "log": int(p[4]), "role": int(p[5])}
     except (IndexError, ValueError):
         return None
-​
-​
+
+
 def build_topic(d: dict) -> str:
     return f"tk|{d['opener']}|{d['kind']}|{d['claimed']}|{d['log']}|{d['role']}"
-​
-​
+
+
 def is_staff(member: discord.Member, role_id: int) -> bool:
     return member.guild_permissions.administrator or any(r.id == role_id for r in member.roles)
-​
-​
+
+
 async def stock_count() -> int:
     rows = await fetch_all(KEYS_TABLE)
     detect_schema(rows)
     return sum(1 for r in rows if not is_revoked(r) and not is_sold(r))
-​
-​
+
+
 async def build_transcript(channel: discord.TextChannel) -> str:
     lines = [f"Transcript ของห้อง #{channel.name}",
              f"สร้างเมื่อ: {dt.datetime.now(TZ_TH):%Y-%m-%d %H:%M:%S} (GMT+7)", "=" * 50]
@@ -593,8 +593,8 @@ async def build_transcript(channel: discord.TextChannel) -> str:
             text = "[embed] " + (m.embeds[0].title or "")
         lines.append(f"[{t}] {m.author} ({m.author.id}): {text}")
     return "\n".join(lines)
-​
-​
+
+
 async def create_ticket(interaction: discord.Interaction, kind: str, cat_id: int,
                         role_id: int, log_id: int, answers: list[tuple[str, str]]):
     await interaction.response.defer(ephemeral=True)
@@ -604,13 +604,13 @@ async def create_ticket(interaction: discord.Interaction, kind: str, cat_id: int
     if not isinstance(category, discord.CategoryChannel) or role is None:
         return await interaction.followup.send(
             "❌ หมวดหมู่หรือยศทีมงานไม่ถูกต้อง แจ้งแอดมินให้สร้างปุ่มใหม่ด้วย /ticket_panel", ephemeral=True)
-​
+
     for ch in guild.text_channels:                      # 1 คน เปิดได้ 1 ticket
         info = parse_topic(ch)
         if info and info["opener"] == user.id:
             return await interaction.followup.send(
                 f"⚠️ คุณมี ticket ที่เปิดอยู่แล้ว: {ch.mention}", ephemeral=True)
-​
+
     P = discord.PermissionOverwrite
     overwrites = {
         guild.default_role: P(view_channel=False),
@@ -633,7 +633,7 @@ async def create_ticket(interaction: discord.Interaction, kind: str, cat_id: int
             "❌ บอทไม่มีสิทธิ์สร้างห้องในหมวดหมู่นี้ (ต้องมี Manage Channels)", ephemeral=True)
     except discord.HTTPException as ex:
         return await interaction.followup.send(f"❌ สร้างห้องไม่สำเร็จ: {ex}", ephemeral=True)
-​
+
     k = KINDS[kind]
     e = discord.Embed(title=k["title"], color=k["color"],
                       description=f"สวัสดี {user.mention} ทีมงานจะเข้ามาตอบโดยเร็วที่สุด กรุณารอสักครู่",
@@ -657,7 +657,7 @@ async def create_ticket(interaction: discord.Interaction, kind: str, cat_id: int
     e.set_footer(text="ปุ่มด้านล่างใช้รับเรื่อง/ปิดตั๋ว")
     await ch.send(content=f"{user.mention} {role.mention}", embed=e,
                   view=TicketControls(), **send_kwargs)
-​
+
     log_ch = guild.get_channel(log_id)
     if log_ch:
         le = discord.Embed(title="🎫 มี Ticket ใหม่", color=k["color"],
@@ -673,20 +673,20 @@ async def create_ticket(interaction: discord.Interaction, kind: str, cat_id: int
             await log_ch.send(content=role.mention, embed=le, view=v)
         except discord.HTTPException as ex:
             print("ticket log error:", repr(ex))
-​
+
     await interaction.followup.send(f"✅ เปิด ticket แล้ว: {ch.mention}", ephemeral=True)
-​
-​
+
+
 async def close_ticket(channel: discord.TextChannel, closer: discord.Member):
     info = parse_topic(channel) or {}
     guild = channel.guild
     text = await build_transcript(channel)
     data = text.encode("utf-8")
-​
+
     def make_file():
         import io
         return discord.File(io.BytesIO(data), filename=f"transcript-{channel.name}.txt")
-​
+
     opener = guild.get_member(info.get("opener", 0))
     log_ch = guild.get_channel(info.get("log", 0))
     if log_ch:
@@ -710,26 +710,26 @@ async def close_ticket(channel: discord.TextChannel, closer: discord.Member):
     await channel.send("🔒 กำลังปิดห้องนี้ใน 5 วินาที...")
     await asyncio.sleep(5)
     await channel.delete(reason=f"ปิด ticket โดย {closer}")
-​
-​
+
+
 class ConfirmClose(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=60)
-​
+
     @discord.ui.button(label="ยืนยันปิดตั๋ว", style=discord.ButtonStyle.danger, emoji="🔒")
     async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="⏳ กำลังปิดตั๋ว...", view=None)
         await close_ticket(interaction.channel, interaction.user)
-​
+
     @discord.ui.button(label="ยกเลิก", style=discord.ButtonStyle.secondary)
     async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="ยกเลิกการปิดตั๋วแล้ว", view=None)
-​
-​
+
+
 class TicketControls(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-​
+
     @discord.ui.button(label="รับเรื่อง", style=discord.ButtonStyle.success, emoji="🙋", custom_id="tk:claim")
     async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
         ch = interaction.channel
@@ -755,7 +755,7 @@ class TicketControls(discord.ui.View):
             await log_ch.send(embed=discord.Embed(
                 title="🙋 รับเรื่อง Ticket", color=0xF1C40F,
                 description=f"{interaction.user.mention} รับเรื่อง {ch.mention}"))
-​
+
     @discord.ui.button(label="ปิดตั๋ว", style=discord.ButtonStyle.danger, emoji="🔒", custom_id="tk:close")
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
         info = parse_topic(interaction.channel)
@@ -764,9 +764,9 @@ class TicketControls(discord.ui.View):
         if interaction.user.id != info["opener"] and not is_staff(interaction.user, info["role"]):
             return await interaction.response.send_message("❌ ไม่มีสิทธิ์ปิดตั๋วนี้", ephemeral=True)
         await interaction.response.send_message("ต้องการปิดตั๋วนี้จริงหรือไม่?", view=ConfirmClose(), ephemeral=True)
-​
-​
-​
+
+
+
 class SlipReviewButton(discord.ui.DynamicItem[discord.ui.Button],
                        template=r"tk:slip:(?P<action>approve|reject):(?P<ticket>\d+)"):
     """ปุ่มให้ทีมงานยืนยัน/ปฏิเสธสลิป โดยเก็บ ID ห้อง ticket ใน custom_id"""
@@ -779,11 +779,11 @@ class SlipReviewButton(discord.ui.DynamicItem[discord.ui.Button],
         super().__init__(discord.ui.Button(
             label=label, style=style, emoji=emoji,
             custom_id=f"tk:slip:{action}:{ticket_id}"))
-​
+
     @classmethod
     async def from_custom_id(cls, interaction, item, match, /):
         return cls(match["action"], int(match["ticket"]))
-​
+
     async def callback(self, interaction: discord.Interaction):
         ticket = interaction.guild.get_channel(self.ticket_id) if interaction.guild else None
         info = parse_topic(ticket) if ticket else None
@@ -793,7 +793,7 @@ class SlipReviewButton(discord.ui.DynamicItem[discord.ui.Button],
         if not is_staff(interaction.user, info["role"]):
             return await interaction.response.send_message(
                 "❌ เฉพาะทีมงานเท่านั้น", ephemeral=True)
-​
+
         if not interaction.message.embeds:
             return await interaction.response.send_message(
                 "❌ ไม่พบข้อมูลสลิปในข้อความนี้", ephemeral=True)
@@ -802,7 +802,7 @@ class SlipReviewButton(discord.ui.DynamicItem[discord.ui.Button],
         if old_footer.startswith("ผลตรวจ:"):
             return await interaction.response.send_message(
                 "⚠️ สลิปนี้มีผลตรวจแล้ว", ephemeral=True)
-​
+
         if self.action == "approve":
             status = f"ทีมงานยืนยันรับชำระแล้ว โดย {interaction.user.display_name}"
             ticket_text = f"✅ ทีมงาน {interaction.user.mention} ตรวจสลิปและยืนยันว่าได้รับชำระแล้ว"
@@ -810,7 +810,7 @@ class SlipReviewButton(discord.ui.DynamicItem[discord.ui.Button],
             status = f"ทีมงานขอให้ส่งสลิปใหม่ โดย {interaction.user.display_name}"
             ticket_text = f"❌ ทีมงาน {interaction.user.mention} ขอให้ตรวจสอบและส่งสลิปใหม่อีกครั้ง"
         e.set_footer(text=f"ผลตรวจ: {status}")
-​
+
         view = discord.ui.View(timeout=None)
         view.add_item(discord.ui.Button(
             label="ยืนยันรับชำระแล้ว", style=discord.ButtonStyle.success, emoji="✅",
@@ -823,19 +823,19 @@ class SlipReviewButton(discord.ui.DynamicItem[discord.ui.Button],
             await ticket.send(ticket_text)
         except discord.HTTPException as ex:
             print("slip decision ticket notification error:", repr(ex))
-​
-​
+
+
 class SlipReviewView(discord.ui.View):
     def __init__(self, ticket_id: int):
         super().__init__(timeout=None)
         self.add_item(SlipReviewButton("approve", ticket_id))
         self.add_item(SlipReviewButton("reject", ticket_id))
-​
-​
+
+
 REVIEW_TOPIC_RE = re.compile(r"เครดิต\s*[:：]\s*(\d+)")
 review_topic_lock = asyncio.Lock()
-​
-​
+
+
 def format_review_topic(topic: str, count: int) -> str:
     """แทน/เพิ่มตัวนับเครดิตใน Topic โดยคงข้อความอื่นและไม่เกิน 1024 ตัวอักษร"""
     marker = f"เครดิต: {count}"
@@ -845,8 +845,8 @@ def format_review_topic(topic: str, count: int) -> str:
     separator = " | " if topic.strip() else ""
     room = max(0, 1024 - len(separator) - len(marker))
     return topic[:room].rstrip() + separator + marker
-​
-​
+
+
 async def ensure_review_topic_counter(channel: discord.TextChannel) -> int:
     async with review_topic_lock:
         topic = channel.topic or ""
@@ -859,8 +859,8 @@ async def ensure_review_topic_counter(channel: discord.TextChannel) -> int:
                            reason="ตั้งตัวนับจำนวนเครดิตรีวิว")
         review_counts[channel.id] = 0
         return 0
-​
-​
+
+
 async def count_review_posts(channel: discord.TextChannel) -> int:
     """นับรีวิวจากข้อความที่บอทส่งไว้ ใช้กู้จำนวนหลัง Railway รีสตาร์ต"""
     if not client.user:
@@ -872,8 +872,8 @@ async def count_review_posts(channel: discord.TextChannel) -> int:
         ):
             total += 1
     return total
-​
-​
+
+
 def queue_review_topic_sync(channel: discord.TextChannel):
     """รวมการแก้ Topic ให้ไม่เกินหนึ่งครั้งต่อช่วง cooldown"""
     loop = asyncio.get_running_loop()
@@ -882,8 +882,8 @@ def queue_review_topic_sync(channel: discord.TextChannel):
     task = review_topic_tasks.get(channel_id)
     if task is None or task.done():
         review_topic_tasks[channel_id] = asyncio.create_task(_delayed_review_topic_sync(channel))
-​
-​
+
+
 async def _delayed_review_topic_sync(channel: discord.TextChannel):
     channel_id = channel.id
     try:
@@ -915,8 +915,8 @@ async def _delayed_review_topic_sync(channel: discord.TextChannel):
     finally:
         if review_topic_tasks.get(channel_id) is asyncio.current_task():
             review_topic_tasks.pop(channel_id, None)
-​
-​
+
+
 async def increment_review_topic_counter(channel: discord.TextChannel) -> int:
     async with review_topic_lock:
         count = review_counts.get(channel.id)
@@ -928,9 +928,9 @@ async def increment_review_topic_counter(channel: discord.TextChannel) -> int:
         review_counts[channel.id] = count
         queue_review_topic_sync(channel)
         return count
-​
-​
-​
+
+
+
 class ReviewModal(discord.ui.Modal):
     def __init__(self, destination_id: int):
         super().__init__(title="เขียนรีวิว")
@@ -940,7 +940,7 @@ class ReviewModal(discord.ui.Modal):
             style=discord.TextStyle.paragraph, required=True, min_length=2,
             max_length=1000)
         self.add_item(self.review_text)
-​
+
     async def on_submit(self, interaction: discord.Interaction):
         # ตอบรับ interaction ทันที ป้องกัน Discord timeout ระหว่างส่งรีวิว/แก้ Topic
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -948,7 +948,7 @@ class ReviewModal(discord.ui.Modal):
         if not isinstance(channel, discord.TextChannel):
             return await interaction.followup.send(
                 "❌ ไม่พบห้องสำหรับส่งรีวิว กรุณาแจ้งแอดมิน", ephemeral=True)
-​
+
         e = discord.Embed(
             title="⭐ รีวิวใหม่",
             description=self.review_text.value.strip(),
@@ -963,7 +963,7 @@ class ReviewModal(discord.ui.Modal):
             print("review send error:", repr(ex))
             return await interaction.followup.send(
                 "❌ ส่งรีวิวไม่สำเร็จ กรุณาลองใหม่หรือติดต่อแอดมิน", ephemeral=True)
-​
+
         try:
             count = await increment_review_topic_counter(channel)
         except Exception as ex:
@@ -974,9 +974,9 @@ class ReviewModal(discord.ui.Modal):
         print(f"[review] updated topic counter: channel={channel.id}, count={count}")
         await interaction.followup.send(
             f"✅ ส่งรีวิวเรียบร้อย ขอบคุณมากครับ/ค่ะ (เครดิตรีวิว: {count})", ephemeral=True)
-​
-​
-​
+
+
+
 class ReviewPanelButton(discord.ui.DynamicItem[discord.ui.Button],
                         template=r"review:submit:(?P<destination>\d+)"):
     """ปุ่มเปิดฟอร์มรีวิว โดยเก็บ ID ห้องปลายทางใน custom_id"""
@@ -985,15 +985,15 @@ class ReviewPanelButton(discord.ui.DynamicItem[discord.ui.Button],
         super().__init__(discord.ui.Button(
             label="เขียนรีวิว", style=discord.ButtonStyle.primary, emoji="⭐",
             custom_id=f"review:submit:{destination_id}"))
-​
+
     @classmethod
     async def from_custom_id(cls, interaction, item, match, /):
         return cls(int(match["destination"]))
-​
+
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(ReviewModal(self.destination_id))
-​
-​
+
+
 class TicketModal(discord.ui.Modal):
     def __init__(self, kind: str, cat: int, role: int, log: int):
         super().__init__(title=KINDS[kind]["modal"])
@@ -1006,12 +1006,12 @@ class TicketModal(discord.ui.Modal):
                 max_length=500 if long else 100)
             self.add_item(ti)
             self.inputs.append(ti)
-​
+
     async def on_submit(self, interaction: discord.Interaction):
         await create_ticket(interaction, self.kind, self.cat, self.role, self.log,
                             [(i.label, i.value) for i in self.inputs])
-​
-​
+
+
 class OpenTicketButton(discord.ui.DynamicItem[discord.ui.Button],
                        template=r"tk:open:(?P<kind>[a-z]+):(?P<cat>\d+):(?P<role>\d+):(?P<log>\d+)"):
     """ปุ่มเปิด ticket: เก็บหมวดหมู่/ยศ/ห้อง log ไว้ใน custom_id จึงไม่ต้องเก็บค่าตั้งไว้ที่ไหน"""
@@ -1021,15 +1021,15 @@ class OpenTicketButton(discord.ui.DynamicItem[discord.ui.Button],
             label=k["label"], emoji=k["emoji"], style=k["style"],
             custom_id=f"tk:open:{kind}:{cat}:{role}:{log}"))
         self.kind, self.cat, self.role, self.log = kind, cat, role, log
-​
+
     @classmethod
     async def from_custom_id(cls, interaction, item, match, /):
         return cls(match["kind"], int(match["cat"]), int(match["role"]), int(match["log"]))
-​
+
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(TicketModal(self.kind, self.cat, self.role, self.log))
-​
-​
+
+
 @tree.command(name="ticket_panel", description="สร้างแผงปุ่มเปิด Ticket ในห้องที่เลือก", guild=G)
 @app_commands.describe(
     channel="ห้องที่จะวางปุ่มเปิด ticket",
@@ -1058,7 +1058,7 @@ async def ticket_panel(interaction: discord.Interaction,
         return await interaction.response.send_message(
             f"❌ บอทไม่มีสิทธิ์ Manage Channels ในหมวดหมู่ **{category.name}**", ephemeral=True)
     log_id = log_channel.id if log_channel else LOG_CHANNEL_ID
-​
+
     e = discord.Embed(
         title=title or "🎫 ศูนย์บริการลูกค้า",
         description=description or ("กดปุ่มด้านล่างเพื่อเปิด ticket\n\n"
@@ -1081,9 +1081,9 @@ async def ticket_panel(interaction: discord.Interaction,
         f"✅ สร้างแผงใน {channel.mention} แล้ว\n"
         f"หมวดหมู่: **{category.name}** | ทีมงาน: {staff_role.mention} | "
         f"ห้องแจ้งเตือน: <#{log_id}>", ephemeral=True)
-​
-​
-​
+
+
+
 @tree.command(name="review_panel", description="สร้างแผงให้สมาชิกส่งรีวิว", guild=G)
 @app_commands.describe(
     panel_channel="ห้องที่จะวางแผงรีวิว",
@@ -1127,8 +1127,8 @@ async def review_panel(interaction: discord.Interaction,
     await interaction.response.send_message(
         f"✅ สร้างแผงใน {panel_channel.mention} แล้ว; รีวิวจะส่งไป {review_channel.mention} "
         f"(เครดิตรีวิวปัจจุบัน: {count})", ephemeral=True)
-​
-​
+
+
 @tree.command(name="tickets", description="ดูรายการ ticket ที่เปิดอยู่ทั้งหมด", guild=G)
 @app_commands.default_permissions(manage_channels=True)
 async def tickets_cmd(interaction: discord.Interaction):
@@ -1144,8 +1144,8 @@ async def tickets_cmd(interaction: discord.Interaction):
     e = discord.Embed(title=f"🎫 Ticket ที่เปิดอยู่ ({len(rows)})", color=0x5865F2,
                       description=("\n".join(rows)[:4000] if rows else "ไม่มี ticket ที่เปิดอยู่"))
     await interaction.response.send_message(embed=e, ephemeral=True)
-​
-​
+
+
 @tree.command(name="ticket_add", description="เพิ่มสมาชิกเข้า ticket นี้", guild=G)
 @app_commands.default_permissions(manage_channels=True)
 async def ticket_add(interaction: discord.Interaction, member: discord.Member):
@@ -1155,8 +1155,8 @@ async def ticket_add(interaction: discord.Interaction, member: discord.Member):
     await interaction.channel.set_permissions(
         member, view_channel=True, send_messages=True, read_message_history=True, attach_files=True)
     await interaction.response.send_message(f"➕ เพิ่ม {member.mention} เข้า ticket แล้ว")
-​
-​
+
+
 @tree.command(name="ticket_remove", description="เอาสมาชิกออกจาก ticket นี้", guild=G)
 @app_commands.default_permissions(manage_channels=True)
 async def ticket_remove(interaction: discord.Interaction, member: discord.Member):
@@ -1167,24 +1167,24 @@ async def ticket_remove(interaction: discord.Interaction, member: discord.Member
         return await interaction.response.send_message("❌ เอาเจ้าของ ticket ออกไม่ได้", ephemeral=True)
     await interaction.channel.set_permissions(member, overwrite=None)
     await interaction.response.send_message(f"➖ เอา {member.mention} ออกจาก ticket แล้ว")
-​
-​
-​
+
+
+
 # ---------- ตรวจสลิปอัตโนมัติ (Slip2Go) ----------
 def receiver_conditions() -> list[dict]:
     """บัญชีที่ยอมรับ: พร้อมเพย์เบอร์โทร หรือ TrueMoney Wallet เบอร์เดียวกัน (ตรงอย่างใดอย่างหนึ่งถือว่าผ่าน)"""
     return [{"accountType": "02001", "accountNumber": RECEIVER_PHONE},
             {"accountType": "04000", "accountNumber": RECEIVER_PHONE}]
-​
-​
+
+
 def guess_mime(att: discord.Attachment) -> str:
     ct = (att.content_type or "").split(";")[0].strip().lower()
     if ct.startswith("image/"):
         return ct
     ext = os.path.splitext(att.filename.lower())[1]
     return {".png": "image/png", ".webp": "image/webp", ".gif": "image/gif"}.get(ext, "image/jpeg")
-​
-​
+
+
 async def verify_slip_image(data: bytes, mime: str,
                             not_before: dt.datetime | None = None) -> dict:
     """ตรวจสลิปซ้ำและผู้รับ; ถ้าระบุ not_before จะตรวจวันโอนด้วย"""
@@ -1218,12 +1218,12 @@ async def verify_slip_image(data: bytes, mime: str,
             return js
     except (aiohttp.ClientError, asyncio.TimeoutError) as ex:
         return {"code": "ERROR", "message": repr(ex)}
-​
-​
+
+
 # จำกัดโฮสต์ของลิงก์รูปเพื่อไม่ให้บอทดึง URL ภายใน/ปลายทางที่ไม่น่าเชื่อถือ
 SLIP_IMAGE_HOSTS = {"cdn.discordapp.com", "media.discordapp.net"}
-​
-​
+
+
 async def fetch_slip_image(url: str) -> tuple[bytes, str]:
     """ดาวน์โหลดรูปจากลิงก์ HTTPS ของ Discord CDN โดยจำกัดขนาดและไม่ตาม redirect"""
     if len(url) > 2000:
@@ -1234,7 +1234,7 @@ async def fetch_slip_image(url: str) -> tuple[bytes, str]:
             or parsed.username or parsed.password
             or parsed.port not in (None, 443)):
         raise ValueError("ใช้ลิงก์รูป HTTPS จาก Discord เท่านั้น (cdn.discordapp.com หรือ media.discordapp.net)")
-​
+
     timeout = aiohttp.ClientTimeout(total=20)
     async with session.get(url.strip(), timeout=timeout, allow_redirects=False) as response:
         if response.status != 200:
@@ -1245,7 +1245,7 @@ async def fetch_slip_image(url: str) -> tuple[bytes, str]:
         content_length = response.headers.get("Content-Length")
         if content_length and int(content_length) > MAX_SLIP_BYTES:
             raise ValueError(f"รูปต้องมีขนาดไม่เกิน {MAX_SLIP_BYTES // (1024 * 1024)} MB")
-​
+
         chunks = []
         total = 0
         async for chunk in response.content.iter_chunked(64 * 1024):
@@ -1257,11 +1257,11 @@ async def fetch_slip_image(url: str) -> tuple[bytes, str]:
         if not data:
             raise ValueError("ไฟล์รูปว่างเปล่า")
         return data, mime
-​
-​
+
+
 chek_group = app_commands.Group(name="chek", description="คำสั่งตรวจสอบสลิป")
-​
-​
+
+
 @chek_group.command(name="slip", description="ตรวจสลิปจากลิงก์รูป")
 @app_commands.describe(link="ลิงก์รูปสลิป HTTPS จาก Discord CDN")
 @app_commands.default_permissions(manage_messages=True)
@@ -1274,12 +1274,12 @@ async def chek_slip(interaction: discord.Interaction, link: str):
     if not perms or not (perms.manage_messages or perms.administrator):
         return await interaction.response.send_message(
             "คำสั่งนี้สำหรับทีมงานที่มีสิทธิ์จัดการข้อความเท่านั้น", ephemeral=True)
-​
+
     await interaction.response.defer(ephemeral=True, thinking=True)
     if not AUTO_VERIFY:
         return await interaction.followup.send(
             "⚠️ ยังตรวจไม่ได้: ตั้งค่า SLIP2GO_SECRET และ RECEIVER_PHONE ในโฮสต์ก่อน", ephemeral=True)
-​
+
     try:
         data, mime = await fetch_slip_image(link)
         js = await verify_slip_image(data, mime)
@@ -1293,7 +1293,7 @@ async def chek_slip(interaction: discord.Interaction, link: str):
         print("slash slip check error:", repr(ex))
         return await interaction.followup.send(
             "⚠️ เกิดข้อผิดพลาด จึงยังยืนยันจริง/ปลอมไม่ได้", ephemeral=True)
-​
+
     code = str(js.get("code"))
     if code in SLIP_OK_CODES:
         amount_text = ""
@@ -1312,11 +1312,11 @@ async def chek_slip(interaction: discord.Interaction, link: str):
         result = ("⚠️ **ยังยืนยันจริง/ปลอมไม่ได้** — ระบบตรวจไม่สำเร็จ "
                   f"({code}: {js.get('message', 'ไม่ทราบสาเหตุ')})")
     await interaction.followup.send(result, ephemeral=True)
-​
-​
+
+
 tree.add_command(chek_group, guild=discord.Object(id=GUILD_ID))
-​
-​
+
+
 async def check_one_slip(channel: discord.TextChannel, att: discord.Attachment, data: bytes):
     """คืน (kind, js, note) โดย kind = ok | retry | reject | manual"""
     if not AUTO_VERIFY:
@@ -1325,7 +1325,7 @@ async def check_one_slip(channel: discord.TextChannel, att: discord.Attachment, 
     if used >= MAX_VERIFY_PER_TICKET:
         return "manual", None, f"ตรวจอัตโนมัติครบ {MAX_VERIFY_PER_TICKET} ครั้งต่อ ticket แล้ว โปรดตรวจเอง"
     verify_attempts[channel.id] = used + 1
-​
+
     js = await verify_slip_image(data, guess_mime(att), channel.created_at)
     code = str(js.get("code"))
     if code in SLIP_OK_CODES:
@@ -1339,16 +1339,16 @@ async def check_one_slip(channel: discord.TextChannel, att: discord.Attachment, 
     if code in ("401004", "401005", "401006"):
         note += " | ⚠️ แพ็กเกจ/โทเคน Slip2Go หมด ต้องเติมก่อน"
     return "manual", js, note
-​
-​
+
+
 def fmt_slip_time(iso: str | None) -> str:
     try:
         t = dt.datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
         return t.astimezone(TZ_TH).strftime("%d/%m/%Y %H:%M") + " น."
     except Exception:
         return str(iso or "-")
-​
-​
+
+
 def slip_embed(message: discord.Message, kind: str, js: dict | None, note: str | None) -> discord.Embed:
     titles = {"ok": ("✅ สลิปจริง — Slip2Go พบรายการโอน", 0x2ECC71),
               "reject": ("❌ สลิปไม่ผ่านการตรวจ — อาจปลอมหรือข้อมูลไม่ตรง", 0xE74C3C),
@@ -1383,8 +1383,8 @@ def slip_embed(message: discord.Message, kind: str, js: dict | None, note: str |
             "manual": "ระบบไม่ได้ตรวจอัตโนมัติ · โปรดตรวจกับแอปธนาคารเอง"}[kind]
     e.set_footer(text=foot)
     return e
-​
-​
+
+
 @client.event
 async def on_message(message: discord.Message):
     """รับรูปจากเจ้าของ order ticket → ตรวจสลิปอัตโนมัติ → ส่งผลให้ทีมงานกดยืนยัน"""
@@ -1393,7 +1393,7 @@ async def on_message(message: discord.Message):
     info = parse_topic(message.channel)
     if not info or info.get("kind") != "order" or message.author.id != info["opener"]:
         return
-​
+
     attachments = [a for a in message.attachments
                    if (a.content_type or "").lower().startswith("image/")
                    or a.filename.lower().endswith(IMAGE_EXTENSIONS)]
@@ -1405,7 +1405,7 @@ async def on_message(message: discord.Message):
     if len(attachments) > MAX_SLIP_FILES or sum(a.size for a in attachments) > MAX_SLIP_TOTAL_BYTES:
         return await message.channel.send(
             f"❌ ส่งได้ไม่เกิน {MAX_SLIP_FILES} รูป และรวมกันไม่เกิน {MAX_SLIP_TOTAL_BYTES // (1024 * 1024)} MB ต่อครั้ง")
-​
+
     log_ch = message.guild.get_channel(info["log"]) if message.guild else None
     if log_ch is None and message.guild:
         try:
@@ -1414,7 +1414,7 @@ async def on_message(message: discord.Message):
             log_ch = None
     if not isinstance(log_ch, discord.TextChannel):
         return await message.channel.send("❌ ไม่พบห้องทีมงานสำหรับตรวจสลิป กรุณาแจ้งแอดมิน")
-​
+
     lines: list[str] = []
     had_reject = False
     status_reply = await message.reply("🔎 กำลังตรวจสลิปกับ Slip2Go...", mention_author=False)
@@ -1428,13 +1428,13 @@ async def on_message(message: discord.Message):
                     print("slip download error:", repr(ex))
                     lines.append(f"❌ {label}: ดาวน์โหลดรูปไม่สำเร็จ กรุณาส่งใหม่")
                     continue
-​
+
                 kind, js, note = await check_one_slip(message.channel, att, data)
-​
+
                 if kind == "retry":                      # รูปมีปัญหา: บอกลูกค้าอย่างเดียว
                     lines.append(f"⚠️ {label}: {note}")
                     continue
-​
+
                 e = slip_embed(message, kind, js, note)
                 view = SlipReviewView(message.channel.id) if kind in ("ok", "manual") else None
                 f = discord.File(io.BytesIO(data), filename=att.filename)
@@ -1448,7 +1448,7 @@ async def on_message(message: discord.Message):
                     print("slip forwarding error:", repr(ex))
                     lines.append(f"❌ {label}: ส่งให้ทีมงานไม่สำเร็จ กรุณาแจ้งทีมงานใน ticket นี้")
                     continue
-​
+
                 if kind == "ok":
                     amt = ""
                     d = (js or {}).get("data") or {}
@@ -1466,7 +1466,7 @@ async def on_message(message: discord.Message):
         print("slip handler error:", repr(ex))
         error_text = "❌ เกิดข้อผิดพลาดระหว่างตรวจสลิป กรุณาแจ้งทีมงานใน ticket นี้"
         return await status_reply.edit(content=error_text)
-​
+
     if any(l.startswith("✅") for l in lines):
         lines.append("หมายเหตุ: ผลนี้ยืนยันรายการโอน แต่ทีมงานยังต้องเทียบยอดกับออเดอร์ก่อนยืนยันรับชำระ")
     if had_reject:
@@ -1474,11 +1474,11 @@ async def on_message(message: discord.Message):
     if lines:
         response = f"{message.author.mention}\n" + "\n".join(lines)
         await status_reply.edit(content=response[:1900])
-​
-​
+
+
 _ticket_ready = False
-​
-​
+
+
 @client.event
 async def on_ready():
     global session, _ticket_ready
@@ -1513,8 +1513,8 @@ async def on_ready():
     if not intents.message_content:
         print("[ticket] เปิด Message Content Intent ใน Discord Developer Portal และตั้ง ENABLE_MESSAGE_CONTENT=1 เพื่อให้บอทตรวจพบไฟล์แนบใน ticket")
     print(f"Logged in as {client.user}")
-​
-​
+
+
 if __name__ == "__main__":
     if not TOKEN or not SUPABASE_KEY:
         raise SystemExit("ตั้งค่า DISCORD_TOKEN และ SUPABASE_KEY ในไฟล์ .env ก่อน")
