@@ -374,7 +374,7 @@ async def update_shop_presence(config: dict, force: bool = False):
     if not force and LAST_SHOP_PRESENCE_STATUS == status:
         return
 
-    label = "เปิด🟢" if is_open else "ปิด🔴"
+    label = "เปิดให้บริการ🟢" if is_open else "ปิดให้บริการ🔴"
     await client.change_presence(
         status=discord.Status.online,
         activity=discord.Game(name=label),
