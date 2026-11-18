@@ -1611,21 +1611,32 @@ MUSIC_REPEAT: set[int] = set()
 MAX_PLAYLIST_TRACKS = 50
 
 
-def extract_music_tracks(query: str) -> list[dict]:
+def is_soundcloud_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    return (
+        parsed.scheme in ("http", "https")
+        and (
+            host == "soundcloud.com"
+            or host.endswith(".soundcloud.com")
+            or host == "on.soundcloud.com"
+        )
+    )
+
+
+def extract_music_tracks(url: str) -> list[dict]:
+    """Extract public SoundCloud tracks or playlist entries; no login cookies."""
     if yt_dlp is None:
         raise RuntimeError("ยังไม่ได้ติดตั้ง yt-dlp")
-    parsed = urlparse(query)
-    if parsed.scheme and parsed.scheme not in ("http", "https"):
-        raise ValueError("รองรับเฉพาะ URL http/https หรือคำค้นหา")
-    if parsed.scheme in ("http", "https"):
-        host = (parsed.hostname or "").lower()
-        if not (host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")):
-            raise ValueError("รองรับ URL YouTube/playlist เท่านั้น หรือใส่ชื่อเพลงเพื่อค้นหา")
-    target = query if parsed.scheme in ("http", "https") else f"ytsearch1:{query}"
+    url = url.strip()
+    if not is_soundcloud_url(url):
+        if "spotify.com" in (urlparse(url).hostname or "").lower():
+            raise ValueError("Spotify ใช้ส่งลิงก์ได้ แต่บอทเล่นเสียง Spotify ในห้องเสียงไม่ได้ กรุณาใช้ลิงก์ SoundCloud สาธารณะ")
+        raise ValueError("กรุณาใส่ลิงก์เพลงหรือ playlist สาธารณะจาก SoundCloud")
     opts = {"quiet": True, "no_warnings": True, "skip_download": True,
             "extract_flat": "in_playlist", "noplaylist": False}
     with yt_dlp.YoutubeDL(opts) as ydl:
-        result = ydl.extract_info(target, download=False)
+        result = ydl.extract_info(url, download=False)
     entries = result.get("entries") if isinstance(result, dict) and result.get("entries") else [result]
     tracks = []
     for item in entries:
@@ -1634,20 +1645,22 @@ def extract_music_tracks(query: str) -> list[dict]:
         url = item.get("webpage_url") or item.get("original_url")
         if not url:
             raw_url = item.get("url", "")
-            if raw_url.startswith(("http://", "https://")):
+            if is_soundcloud_url(raw_url):
                 url = raw_url
-            elif item.get("id"):
-                url = f"https://www.youtube.com/watch?v={item['id']}"
-        if url and url.startswith(("http://", "https://")):
+        if url and is_soundcloud_url(url):
             tracks.append({"title": str(item.get("title") or "ไม่ทราบชื่อ")[:180], "url": url})
         if len(tracks) >= MAX_PLAYLIST_TRACKS:
             break
+    if not tracks:
+        raise ValueError("ไม่พบเพลง SoundCloud สาธารณะ หรือเพลงนี้ถูกจำกัดการเล่น")
     return tracks
 
 
 def resolve_audio_stream(url: str) -> tuple[str, str]:
     if yt_dlp is None:
         raise RuntimeError("ยังไม่ได้ติดตั้ง yt-dlp")
+    if not is_soundcloud_url(url):
+        raise ValueError("ลิงก์เพลงไม่ใช่ SoundCloud")
     opts = {"quiet": True, "no_warnings": True, "format": "bestaudio/best", "noplaylist": True}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -1703,9 +1716,9 @@ async def music_player(guild: discord.Guild, text_channel: discord.abc.Messageab
         MUSIC_TASKS.pop(gid, None)
 
 
-@tree.command(name="play", description="เปิดเพลงจากคำค้นหา, URL หรือ playlist", guild=G)
-@app_commands.describe(query="ชื่อเพลงหรือ URL ของเพลง/playlist")
-async def play_cmd(interaction: discord.Interaction, query: str):
+@tree.command(name="play", description="เปิดเพลงจากลิงก์ SoundCloud หรือ playlist สาธารณะ", guild=G)
+@app_commands.describe(soundcloud_url="ลิงก์เพลงหรือ playlist สาธารณะจาก SoundCloud")
+async def play_cmd(interaction: discord.Interaction, soundcloud_url: str):
     if interaction.guild is None or not isinstance(interaction.user, discord.Member):
         return await interaction.response.send_message("❌ ใช้ได้ในเซิร์ฟเวอร์เท่านั้น", ephemeral=True)
     if yt_dlp is None:
@@ -1715,9 +1728,9 @@ async def play_cmd(interaction: discord.Interaction, query: str):
         return await interaction.response.send_message("❌ เข้าห้องเสียงก่อนใช้คำสั่งนี้", ephemeral=True)
     await interaction.response.defer(thinking=True)
     try:
-        tracks = await asyncio.to_thread(extract_music_tracks, query.strip())
+        tracks = await asyncio.to_thread(extract_music_tracks, soundcloud_url.strip())
         if not tracks:
-            return await interaction.followup.send("❌ ไม่พบเพลงจากคำค้นหานี้")
+            return await interaction.followup.send("❌ ไม่พบเพลง SoundCloud สาธารณะ")
         queue = MUSIC_QUEUES.setdefault(interaction.guild.id, asyncio.Queue())
         if queue.qsize() + len(tracks) > 100:
             return await interaction.followup.send("❌ คิวเพลงเกิน 100 เพลง กรุณารอให้เพลงเล่นก่อน")
@@ -1740,7 +1753,8 @@ async def play_cmd(interaction: discord.Interaction, query: str):
         await interaction.followup.send(f"❌ {ex}")
     except Exception as ex:
         print("play command error:", repr(ex))
-        await interaction.followup.send("❌ เปิดเพลงไม่สำเร็จ ตรวจสอบ yt-dlp, FFmpeg และสิทธิ์ห้องเสียง")
+        await interaction.followup.send(
+            "❌ เปิดเพลง SoundCloud ไม่สำเร็จ ตรวจว่าลิงก์เป็นสาธารณะและบอทมีสิทธิ์เข้าห้องเสียง")
 
 
 @tree.command(name="loop", description="เปิด/ปิดวนเพลงปัจจุบัน", guild=G)
