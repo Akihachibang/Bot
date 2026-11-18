@@ -8,11 +8,16 @@ Discord Key Bot (v2 - ตรวจชื่อคอลัมน์อัตโ�
     DISCORD_TOKEN=...
     SUPABASE_URL=https://cgsuxxyezqhxayllhzfs.supabase.co
     SUPABASE_KEY=...
+    ENABLE_MESSAGE_CONTENT=1          # จำเป็น: ให้บอทเห็นรูปสลิปที่แนบใน ticket
+    SLIP2GO_SECRET=...                # Secret Key จากหน้า API Connect > Authentication ของ Slip2Go
+    RECEIVER_PHONE=0XXXXXXXXX         # เบอร์พร้อมเพย์/TrueMoney ที่รับเงิน (ใช้เช็คว่าสลิปโอนเข้าบัญชีเรา)
 """
 import os
 import re
 import json
 import asyncio
+import base64
+import io
 import datetime as dt
 from zoneinfo import ZoneInfo
 
@@ -50,6 +55,31 @@ MAX_SLIP_BYTES = 8 * 1024 * 1024
 MAX_SLIP_TOTAL_BYTES = 16 * 1024 * 1024
 MAX_SLIP_FILES = 4
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+
+# ---------- ตรวจสลิปอัตโนมัติด้วย Slip2Go ----------
+SLIP2GO_API_URL = os.getenv("SLIP2GO_API_URL", "https://connect.slip2go.com").rstrip("/")
+SLIP2GO_SECRET = os.getenv("SLIP2GO_SECRET", "").strip()
+RECEIVER_PHONE = re.sub(r"\D", "", os.getenv("RECEIVER_PHONE", ""))  # เลขล้วน ไม่มีขีด/เว้นวรรค
+# ต้องมีทั้งคีย์และเบอร์ผู้รับ ถึงจะเปิดตรวจอัตโนมัติ (ไม่มีเบอร์ผู้รับ = สลิปโอนให้ใครก็ผ่าน จึงไม่เปิดให้)
+AUTO_VERIFY = bool(SLIP2GO_SECRET and RECEIVER_PHONE)
+SLIP_TIME_SLACK_MINUTES = 2     # สลิปต้องโอนหลังเปิด ticket (เผื่อเวลาบนสลิปที่ปัดเป็นนาที)
+MAX_VERIFY_PER_TICKET = 5       # จำกัดจำนวนครั้งที่ยิง API ต่อ 1 ticket กันลูกค้าส่งรูปรัวจนโควตาหมด
+SLIP_OK_CODES = {"200000", "200200"}
+# รหัสที่แปลว่า "รูปมีปัญหา" ให้ลูกค้าส่งใหม่ ไม่ต้องรบกวนทีมงาน
+SLIP_RETRY = {
+    "400001": "อ่าน QR บนสลิปไม่ได้ กรุณาส่งรูปสลิปเต็มใบที่เห็น QR ชัดเจน (ไม่ครอป ไม่เบลอ)",
+    "400002": "ไฟล์รูปไม่ถูกต้อง กรุณาส่งใหม่เป็นรูปสลิปจากแอปธนาคาร",
+    "400005": "ไฟล์รูปไม่ถูกต้อง กรุณาส่งใหม่เป็นรูปสลิปจากแอปธนาคาร",
+}
+# รหัสที่แปลว่า "สลิปไม่ผ่านเงื่อนไข" ต้องแจ้งทีมงานด้วย
+SLIP_REJECT = {
+    "200401": "สลิปนี้ไม่ได้โอนเข้าบัญชีของร้าน",
+    "200403": "วันเวลาโอนไม่ถูกต้อง (ต้องโอนหลังเปิด ticket นี้)",
+    "200404": "ไม่พบรายการนี้ในระบบธนาคาร",
+    "200500": "สลิปไม่ผ่านการตรวจสอบ กรุณาติดต่อทีมงาน",
+    "200501": "สลิปนี้ถูกใช้งานไปแล้ว",
+}
+verify_attempts: dict[int, int] = {}
 QR_IMAGE_URL = os.getenv(
     "QR_IMAGE_URL",
     "https://cdn.discordapp.com/attachments/1572106348022337677/1572260772615032913/"
@@ -1139,9 +1169,120 @@ async def ticket_remove(interaction: discord.Interaction, member: discord.Member
 
 
 
+# ---------- ตรวจสลิปอัตโนมัติ (Slip2Go) ----------
+def receiver_conditions() -> list[dict]:
+    """บัญชีที่ยอมรับ: พร้อมเพย์เบอร์โทร หรือ TrueMoney Wallet เบอร์เดียวกัน (ตรงอย่างใดอย่างหนึ่งถือว่าผ่าน)"""
+    return [{"accountType": "02001", "accountNumber": RECEIVER_PHONE},
+            {"accountType": "04000", "accountNumber": RECEIVER_PHONE}]
+
+
+def guess_mime(att: discord.Attachment) -> str:
+    ct = (att.content_type or "").split(";")[0].strip().lower()
+    if ct.startswith("image/"):
+        return ct
+    ext = os.path.splitext(att.filename.lower())[1]
+    return {".png": "image/png", ".webp": "image/webp", ".gif": "image/gif"}.get(ext, "image/jpeg")
+
+
+async def verify_slip_image(data: bytes, mime: str, not_before: dt.datetime) -> dict:
+    """ส่งรูปสลิปไปตรวจที่ Slip2Go (base64) พร้อมเงื่อนไข: ไม่ซ้ำ + ผู้รับตรง + โอนหลังเปิด ticket
+    คืน dict ที่มี key 'code' เสมอ; ถ้าเรียก API ไม่ได้คืน code='ERROR'"""
+    nb = not_before.astimezone(dt.timezone.utc) - dt.timedelta(minutes=SLIP_TIME_SLACK_MINUTES)
+    body = {"payload": {
+        "imageBase64": f"data:{mime};base64,{base64.b64encode(data).decode()}",
+        "checkCondition": {
+            "checkDuplicate": True,
+            "checkReceiver": receiver_conditions(),
+            "checkDate": {"type": "gte", "date": nb.strftime("%Y-%m-%dT%H:%M:%S.000Z")},
+        },
+    }}
+    try:
+        async with session.post(
+                f"{SLIP2GO_API_URL}/api/verify-slip/qr-base64/info", json=body,
+                headers={"Authorization": f"Bearer {SLIP2GO_SECRET}"},
+                timeout=aiohttp.ClientTimeout(total=30)) as r:
+            try:
+                js = await r.json(content_type=None)
+            except Exception:
+                js = None
+            if not isinstance(js, dict) or "code" not in js:
+                return {"code": "ERROR", "message": f"HTTP {r.status}"}
+            return js
+    except (aiohttp.ClientError, asyncio.TimeoutError) as ex:
+        return {"code": "ERROR", "message": repr(ex)}
+
+
+async def check_one_slip(channel: discord.TextChannel, att: discord.Attachment, data: bytes):
+    """คืน (kind, js, note) โดย kind = ok | retry | reject | manual"""
+    if not AUTO_VERIFY:
+        return "manual", None, "ยังไม่ได้ตั้งค่าตรวจอัตโนมัติ (SLIP2GO_SECRET / RECEIVER_PHONE)"
+    used = verify_attempts.get(channel.id, 0)
+    if used >= MAX_VERIFY_PER_TICKET:
+        return "manual", None, f"ตรวจอัตโนมัติครบ {MAX_VERIFY_PER_TICKET} ครั้งต่อ ticket แล้ว โปรดตรวจเอง"
+    verify_attempts[channel.id] = used + 1
+
+    js = await verify_slip_image(data, guess_mime(att), channel.created_at)
+    code = str(js.get("code"))
+    if code in SLIP_OK_CODES:
+        return "ok", js, None
+    if code in SLIP_RETRY:
+        return "retry", js, SLIP_RETRY[code]
+    if code in SLIP_REJECT:
+        return "reject", js, SLIP_REJECT[code]
+    print(f"[slip2go] ตรวจไม่สำเร็จ code={code} message={js.get('message')}")
+    note = f"ตรวจอัตโนมัติไม่สำเร็จ ({code}: {js.get('message', '')}) โปรดตรวจเอง"
+    if code in ("401004", "401005", "401006"):
+        note += " | ⚠️ แพ็กเกจ/โทเคน Slip2Go หมด ต้องเติมก่อน"
+    return "manual", js, note
+
+
+def fmt_slip_time(iso: str | None) -> str:
+    try:
+        t = dt.datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        return t.astimezone(TZ_TH).strftime("%d/%m/%Y %H:%M") + " น."
+    except Exception:
+        return str(iso or "-")
+
+
+def slip_embed(message: discord.Message, kind: str, js: dict | None, note: str | None) -> discord.Embed:
+    titles = {"ok": ("✅ ตรวจสลิปอัตโนมัติผ่านแล้ว", 0x2ECC71),
+              "reject": ("🚫 สลิปไม่ผ่านการตรวจอัตโนมัติ", 0xE74C3C),
+              "manual": ("💳 ได้รับรูปสลิป (ต้องตรวจเอง)", 0xF1C40F)}
+    title, color = titles[kind]
+    e = discord.Embed(
+        title=title, color=color, timestamp=dt.datetime.now(dt.timezone.utc),
+        description=f"ผู้ส่ง: {message.author.mention} (`{message.author.id}`)\n"
+                    f"Ticket: {message.channel.mention}")
+    if note:
+        e.add_field(name="หมายเหตุ", value=note[:1000], inline=False)
+    d = (js or {}).get("data")
+    if isinstance(d, dict) and d.get("amount") is not None:
+        try:
+            e.add_field(name="💰 ยอดโอน", value=f"**{float(d['amount']):,.2f}** บาท", inline=True)
+        except (TypeError, ValueError):
+            pass
+        e.add_field(name="🕒 เวลาโอน", value=fmt_slip_time(d.get("dateTime")), inline=True)
+        e.add_field(name="🔖 เลขอ้างอิง", value=f"`{d.get('transRef', '-')}`", inline=False)
+        snd = (d.get("sender") or {})
+        rcv = (d.get("receiver") or {})
+        e.add_field(name="ผู้โอน",
+                    value=f"{(snd.get('account') or {}).get('name', '-')}\n"
+                          f"{(snd.get('bank') or {}).get('name', '')}", inline=True)
+        e.add_field(name="ผู้รับ",
+                    value=f"{(rcv.get('account') or {}).get('name', '-')}\n"
+                          f"{(rcv.get('bank') or {}).get('name', '')}", inline=True)
+    if js and js.get("code"):
+        e.add_field(name="รหัสผลตรวจ", value=f"`{js['code']}` {js.get('message', '')}"[:200], inline=False)
+    foot = {"ok": "ตรวจกับระบบธนาคารผ่าน Slip2Go แล้ว · ทีมงานเทียบยอดกับออเดอร์ แล้วกดยืนยัน",
+            "reject": "สลิปไม่ผ่านเงื่อนไข จึงไม่มีปุ่มยืนยัน",
+            "manual": "ระบบไม่ได้ตรวจอัตโนมัติ · โปรดตรวจกับแอปธนาคารเอง"}[kind]
+    e.set_footer(text=foot)
+    return e
+
+
 @client.event
 async def on_message(message: discord.Message):
-    """รับรูปจากเจ้าของ order ticket แล้วส่งสำเนาไปให้ทีมงานตรวจ"""
+    """รับรูปจากเจ้าของ order ticket → ตรวจสลิปอัตโนมัติ → ส่งผลให้ทีมงานกดยืนยัน"""
     if message.author.bot or not isinstance(message.channel, discord.TextChannel):
         return
     info = parse_topic(message.channel)
@@ -1169,30 +1310,62 @@ async def on_message(message: discord.Message):
     if not isinstance(log_ch, discord.TextChannel):
         return await message.channel.send("❌ ไม่พบห้องทีมงานสำหรับตรวจสลิป กรุณาแจ้งแอดมิน")
 
-    files = []
+    lines: list[str] = []
+    had_reject = False
     try:
-        for attachment in attachments:
-            files.append(await attachment.to_file())
-        e = discord.Embed(
-            title="💳 ได้รับรูปสลิปเพื่อให้ทีมงานตรวจ",
-            description=f"ผู้ส่ง: {message.author.mention} (`{message.author.id}`)\n"
-                        f"Ticket: {message.channel.mention}",
-            color=0xF1C40F, timestamp=dt.datetime.now(dt.timezone.utc))
-        e.set_footer(text="ผลตรวจจะอ้างอิงการพิจารณาของทีมงาน ไม่ใช่การตรวจสอบอัตโนมัติจากธนาคาร")
-        await log_ch.send(
-            content=f"<@&{info['role']}>", embed=e, files=files,
-            view=SlipReviewView(message.channel.id),
-            allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False))
-        await message.channel.send("✅ ส่งรูปสลิปให้ทีมงานตรวจแล้ว กรุณารอผลใน ticket นี้")
-    except discord.HTTPException as ex:
-        print("slip forwarding error:", repr(ex))
-        await message.channel.send("❌ ส่งรูปสลิปให้ทีมงานไม่สำเร็จ กรุณาแจ้งทีมงานใน ticket นี้")
-    finally:
-        for f in files:
-            try:
-                f.close()
-            except Exception:
-                pass
+        async with message.channel.typing():
+            for i, att in enumerate(attachments, 1):
+                label = f"สลิปที่ {i}" if len(attachments) > 1 else "สลิป"
+                try:
+                    data = await att.read()
+                except discord.HTTPException as ex:
+                    print("slip download error:", repr(ex))
+                    lines.append(f"❌ {label}: ดาวน์โหลดรูปไม่สำเร็จ กรุณาส่งใหม่")
+                    continue
+
+                kind, js, note = await check_one_slip(message.channel, att, data)
+
+                if kind == "retry":                      # รูปมีปัญหา: บอกลูกค้าอย่างเดียว
+                    lines.append(f"⚠️ {label}: {note}")
+                    continue
+
+                e = slip_embed(message, kind, js, note)
+                view = SlipReviewView(message.channel.id) if kind in ("ok", "manual") else None
+                f = discord.File(io.BytesIO(data), filename=att.filename)
+                try:
+                    kwargs = {"view": view} if view else {}
+                    await log_ch.send(
+                        content=f"<@&{info['role']}>", embed=e, file=f,
+                        allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+                        **kwargs)
+                except discord.HTTPException as ex:
+                    print("slip forwarding error:", repr(ex))
+                    lines.append(f"❌ {label}: ส่งให้ทีมงานไม่สำเร็จ กรุณาแจ้งทีมงานใน ticket นี้")
+                    continue
+
+                if kind == "ok":
+                    amt = ""
+                    d = (js or {}).get("data") or {}
+                    try:
+                        amt = f" ยอด **{float(d['amount']):,.2f}** บาท"
+                    except (KeyError, TypeError, ValueError):
+                        pass
+                    lines.append(f"✅ {label}: ตรวจสำเร็จ{amt}")
+                elif kind == "reject":
+                    had_reject = True
+                    lines.append(f"❌ {label}: {note}")
+                else:
+                    lines.append(f"⏳ {label}: ส่งให้ทีมงานตรวจสอบแล้ว")
+    except Exception as ex:
+        print("slip handler error:", repr(ex))
+        return await message.channel.send("❌ เกิดข้อผิดพลาดระหว่างตรวจสลิป กรุณาแจ้งทีมงานใน ticket นี้")
+
+    if any(l.startswith(("✅", "⏳")) for l in lines):
+        lines.append("กรุณารอทีมงานยืนยันใน ticket นี้")
+    elif had_reject:
+        lines.append("หากคิดว่าระบบตรวจผิด แจ้งทีมงานใน ticket นี้ได้เลย")
+    if lines:
+        await message.channel.send(f"{message.author.mention}\n" + "\n".join(lines))
 
 
 _ticket_ready = False
@@ -1225,6 +1398,10 @@ async def on_ready():
         for ch in guild.text_channels:
             if REVIEW_TOPIC_RE.search(ch.topic or ""):
                 queue_review_topic_sync(ch)
+    if AUTO_VERIFY:
+        print(f"[slip2go] เปิดตรวจสลิปอัตโนมัติ (เช็คผู้รับ ***{RECEIVER_PHONE[-4:]})")
+    else:
+        print("[slip2go] ปิดตรวจอัตโนมัติ: ต้องตั้งทั้ง SLIP2GO_SECRET และ RECEIVER_PHONE (ตอนนี้ส่งสลิปให้ทีมงานตรวจเอง)")
     if not intents.message_content:
         print("[ticket] เปิด Message Content Intent ใน Discord Developer Portal และตั้ง ENABLE_MESSAGE_CONTENT=1 เพื่อให้บอทตรวจพบไฟล์แนบใน ticket")
     print(f"Logged in as {client.user}")
